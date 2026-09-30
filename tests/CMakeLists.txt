@@ -9,7 +9,7 @@
 #   Cleaning:
 #     cmake --build ./build/ --target clean
 ########################################################################################################################
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.12)
 
 project(chipyard-tests LANGUAGES C CXX)
 
@@ -143,3 +143,11 @@ add_custom_command(
 add_custom_target(spiflash_img ALL
     DEPENDS ${CMAKE_BINARY_DIR}/spiflash.img
 )
+
+# Resident Atlas dispatcher with a Saturn RVV data-handoff test.
+include("${CMAKE_CURRENT_SOURCE_DIR}/../generators/atlas-npu/baremetal/dispatcher/dispatcher.cmake")
+add_executable(saturn_atlas_dispatcher saturn_atlas_dispatcher.c)
+target_compile_options(saturn_atlas_dispatcher PRIVATE -march=rv64gcv_zfh_zvfh -mabi=lp64d -mcmodel=medany)
+target_link_options(saturn_atlas_dispatcher PRIVATE -march=rv64gcv_zfh_zvfh -mabi=lp64d -mcmodel=medany)
+atlas_use_dispatcher(saturn_atlas_dispatcher)
+add_dump_target(saturn_atlas_dispatcher)
