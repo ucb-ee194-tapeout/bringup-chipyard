@@ -60,7 +60,7 @@
 	url = https://github.com/firesim/firesim.git
 [submodule "software/baremetal-ide"]
 	path = software/baremetal-ide
-	url = https://github.com/ucb-bar/Baremetal-IDE.git
+	url = https://github.com/ucb-ee194-tapeout/Baremetal-IDE.git
 [submodule "software/coremark"]
 	path = software/coremark
 	url = https://github.com/ucb-bar/coremark-workload.git
