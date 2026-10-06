@@ -1,5 +1,5 @@
 package chipyard
-
+ 
 import freechips.rocketchip.diplomacy.AddressSet
 import saturn.common._
 import atlas.config._
@@ -142,3 +142,20 @@ class TetheredEE290Config extends Config(
   new chipyard.harness.WithMultiChipSerialTL(0, 1) ++                // connect the serial-tl ports of the chips together
   new chipyard.harness.WithMultiChip(0, new EE290SimPeripheralConfig) ++ // ChipTop0 is the design-to-be-taped-out
   new chipyard.harness.WithMultiChip(1, new EE290BringupHostConfig))  // ChipTop1 is the bringup design
+
+class EE290BaseConfig extends Config(
+  new chipyard.config.WithSystemBusWidth(bitWidth = 256) ++
+  new freechips.rocketchip.subsystem.WithExtMemSize(x"10_0000_0000") ++
+  new freechips.rocketchip.subsystem.WithCacheBlockBytes(32) ++
+  new freechips.rocketchip.subsystem.WithNMemoryChannels(1) ++
+  new freechips.rocketchip.subsystem.WithEdgeDataBits(64) ++
+
+  new chipyard.config.WithPeripheryBusFrequency(500.0) ++
+  new chipyard.config.WithMemoryBusFrequency(500.0) ++
+  new chipyard.config.WithControlBusFrequency(500.0) ++
+  new chipyard.config.WithSystemBusFrequency(500.0) ++
+  new chipyard.config.WithFrontBusFrequency(500.0) ++
+  new chipyard.config.WithOffchipBusFrequency(500.0) ++
+  new chipyard.harness.WithHarnessBinderClockFreqMHz(500.0) ++
+  new testchipip.boot.WithNoCustomBootPin ++
+  new chipyard.config.AbstractConfig)
