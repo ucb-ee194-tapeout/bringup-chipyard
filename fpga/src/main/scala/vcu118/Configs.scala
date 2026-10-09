@@ -29,13 +29,13 @@ class WithDefaultPeripherals extends Config((site, here, up) => {
 
 class WithSystemModifications extends Config((site, here, up) => {
   case DTSTimebase => BigInt((1e6).toLong)
-  case BootROMLocated(x) => up(BootROMLocated(x), site).map { p =>
-    // invoke makefile for sdboot
-    val freqMHz = (site(SystemBusKey).dtsFrequency.get / (1000 * 1000)).toLong
-    val make = s"make -C fpga/src/main/resources/vcu118/sdboot PBUS_CLK=${freqMHz} bin"
-    require (make.! == 0, "Failed to build bootrom")
-    p.copy(hang = 0x10000, contentFileName = SystemFileName(s"./fpga/src/main/resources/vcu118/sdboot/build/sdboot.bin"))
-  }
+  // case BootROMLocated(x) => up(BootROMLocated(x), site).map { p =>
+  //   // invoke makefile for sdboot
+  //   val freqMHz = (site(SystemBusKey).dtsFrequency.get / (1000 * 1000)).toLong
+  //   val make = s"make -C fpga/src/main/resources/vcu118/sdboot PBUS_CLK=${freqMHz} bin"
+  //   require (make.! == 0, "Failed to build bootrom")
+  //   p.copy(hang = 0x10000, contentFileName = SystemFileName(s"./fpga/src/main/resources/vcu118/sdboot/build/sdboot.bin"))
+  // }
   case ExtMem => up(ExtMem, site).map(x => x.copy(master = x.master.copy(size = site(VCU118DDRSize)))) // set extmem to DDR size
   case SerialTLKey => Nil // remove serialized tl port
 })
@@ -48,16 +48,26 @@ class WithVCU118Tweaks extends Config(
   new chipyard.config.WithUniformBusFrequencies(100) ++
   new WithFPGAFrequency(100) ++ // default 100MHz freq
   // harness binders
-  new WithUART ++
+  new WithVCU118UARTTSI ++ // UART-TSI on the on-board USB-UART (default debug/loading path)
   new WithSPISDCard ++
   new WithDDRMem ++
   new WithJTAG ++
   // other configuration
+  new chipyard.config.WithNoUART ++ // no peripheral UART by default; opt-in per config
   new WithDefaultPeripherals ++
+  new testchipip.tsi.WithUARTTSIClient ++ // enable UART-TSI client (default 115200 baud)
   new chipyard.config.WithTLBackingMemory ++ // use TL backing memory
   new WithSystemModifications ++ // setup busses, use sdboot bootrom, setup ext. mem. size
   new freechips.rocketchip.subsystem.WithoutTLMonitors ++
   new freechips.rocketchip.subsystem.WithNMemoryChannels(1)
+)
+
+// Re-enable the peripheral UART (disabled in the shared tweaks) and route it to PMOD J52.
+class WithVCU118PeripheralUARTOnPMOD extends Config(
+  new WithVCU118UARTToPMOD() ++
+  new Config((site, here, up) => {
+    case PeripheryUARTKey => List(UARTParams(address = BigInt(0x64000000L)))
+  })
 )
 
 class RocketVCU118Config extends Config(
@@ -70,6 +80,33 @@ class BoomVCU118Config extends Config(
   new WithFPGAFrequency(50) ++
   new WithVCU118Tweaks ++
   new chipyard.MegaBoomV3Config
+)
+
+class EE290VCU118Config extends Config(
+  new WithoutSDIO ++ // drop SDIO peripheral and free AV15 for UART TX
+  new WithVCU118PeripheralUARTOnPMOD ++ // peripheral UART on PMOD J52 (AT15/AT16)
+  new WithFPGAFrequency(50) ++
+  new WithVCU118Tweaks ++
+  new EE290SimConfig
+)
+
+// Drop the SPI/SDIO peripheral and switch the PMOD selector to "JTAG" so the
+// JTAG debug overlay places itself on PMOD_J52 (with proper GCIO + dedicated-route override)
+// instead of FMC_J2. Pairs with the conditional SPI placement in TestHarness.scala
+// and with the UART-on-PMOD binder using non-overlapping PMOD pins (AT16, AV15).
+class WithoutSDIO extends Config((site, here, up) => {
+  case PeripherySPIKey => Nil
+  case VCU118ShellPMOD => "JTAG"
+})
+
+class SmallBroadcastVCU118Config extends Config(
+  new WithVCU118PeripheralUARTOnPMOD ++              // peripheral UART on PMOD J52 (AT16=rx, AV15=tx)
+  new WithoutSDIO ++                                 // free AV15 (was SDIO spi_clk)
+  new WithFPGAFrequency(50) ++
+  new WithVCU118Tweaks ++
+  new chipyard.config.WithBroadcastManager ++        // BroadcastHub instead of L2 inclusive cache
+  new freechips.rocketchip.rocket.WithNSmallCores(1) ++ // single small Rocket (no FPU, no VM)
+  new chipyard.config.AbstractConfig
 )
 
 class WithFPGAFrequency(fMHz: Double) extends Config(
