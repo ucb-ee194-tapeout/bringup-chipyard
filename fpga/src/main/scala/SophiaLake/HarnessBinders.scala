@@ -21,7 +21,7 @@ import testchipip.serdes._
 // Pin maps and constraint helpers
 //==========================================================
 
-/** Package pins for one 8-bit decoupled serial-TL port, in bit order. */
+/** Package pins for one decoupled serial-TL port, in bit order. */
 case class DecoupledSerialTLPins(
   clock:    String,
   outValid: String,
@@ -44,6 +44,22 @@ case class CreditedC2CPins(
   inPhit:    String)
 
 object SophiaLakePins {
+  // TL_IN goes to FPGA out; TL_OUT comes from the chip to FPGA in.
+  val fa26ChipLink = DecoupledSerialTLPins(
+    clock    = "B20",
+    outValid = "B22", outReady = "L18",
+    outPhit  = Seq(
+      "B15", "L19", "G18", "K18", "F16", "L20", "G17", "M20",
+      "F14", "H22", "G16", "J21", "K16", "J22", "L16", "H19",
+      "M15", "C14", "A14", "C15", "C13", "M18", "J14", "M22",
+      "D14", "D17", "G13", "K22", "B13", "B16", "A15", "C18"),
+    inValid  = "B17", inReady  = "J17",
+    inPhit   = Seq(
+      "C22", "K17", "E22", "G15", "E19", "H15", "F19", "H14",
+      "G20", "J15", "G21", "N20", "H20", "L15", "C19", "N18",
+      "D21", "A13", "N22", "N19", "K21", "L14", "D16", "K13",
+      "M21", "M16", "L21", "A16", "C17", "H13", "F18", "E13"))
+
   val dsp25ChipLink = DecoupledSerialTLPins(
     clock    = "A21",
     outValid = "B20", outReady = "E16",
@@ -154,6 +170,19 @@ object SophiaLakePins {
 //==========================================================
 // Serial-TL to GPIO binders
 //==========================================================
+
+/** Copy the configured 32-bit IO and reuse the board's constraint helper. */
+class WithFA26SophiaLakeSerialTLToGPIO extends HarnessBinder({
+  case (th: HasHarnessInstantiators, port: SerialTLPort, chipId: Int) => {
+    val ath = SophiaLakePins.harness(th)
+    val harnessIO = IO(chiselTypeOf(port.io)).suggestName("serial_tl")
+    harnessIO <> port.io
+    harnessIO match {
+      case io: DecoupledPhitIO =>
+        SophiaLakePins.constrainChipLink(ath, io, SophiaLakePins.fa26ChipLink)
+    }
+  }
+})
 
 class WithDSP25SophiaLakeSerialTLToGPIO extends HarnessBinder({
   case (th: HasHarnessInstantiators, port: SerialTLPort, chipId: Int) => {

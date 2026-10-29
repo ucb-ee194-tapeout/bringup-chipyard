@@ -30,7 +30,7 @@ import chipyard.harness.{HarnessClockInstantiator, HarnessClockInstantiatorKey}
 //==========================================================
 
 object SophiaLakeSerialTL {
-  /** Port 0 of every bringup design: the 8-bit decoupled link to the testchip.
+  /** Port 0 of every bringup design: the decoupled link to the testchip (8-bit by default; FA26 overrides to 32-bit).
     *
     * The FPGA is the manager for the chip's [0, 2 GiB) -- everything below
     * DRAM_BASE, including its CLINT at 0x0200_0000 -- and the chip is a client
@@ -41,7 +41,7 @@ object SophiaLakeSerialTL {
     * single-chip configs, SBUS for the C2C configs (which keep [0, 4 GiB) on
     * this FPGA and reserve the OBUS for the peer).
     */
-  def chipLink(slaveWhere: TLBusWrapperLocation = OBUS) = SerialTLParams(
+  def chipLink(slaveWhere: TLBusWrapperLocation = OBUS, phitWidth: Int = 8, flitWidth: Int = 16) = SerialTLParams(
     manager = Some(SerialTLManagerParams(
       memParams = Seq(ManagerRAMParams(
         address = BigInt("00000000", 16),
@@ -50,7 +50,7 @@ object SophiaLakeSerialTL {
       slaveWhere = slaveWhere
     )),
     client    = Some(SerialTLClientParams()),
-    phyParams = DecoupledInternalSyncSerialPhyParams(phitWidth = 8, flitWidth = 16, freqMHz = 50)
+    phyParams = DecoupledInternalSyncSerialPhyParams(phitWidth = phitWidth, flitWidth = flitWidth, freqMHz = 50)
   )
 
   /** Port 1 of the C2C designs: the 1-bit credited source-synchronous link to
@@ -82,6 +82,10 @@ object SophiaLakeSerialTL {
 /** Single serial-TL link to the testchip (single-chip bringup). */
 class WithSophiaLakeChipSerialTL extends Config(
   new WithSerialTL(Seq(SophiaLakeSerialTL.chipLink())))
+
+/** FA26: 32 lanes per direction with 32-bit flits (matches the chip's SerialTL). TODO: confirm flit width with the chip owner. */
+class WithSophiaLakeFA26ChipSerialTL extends Config(
+  new WithSerialTL(Seq(SophiaLakeSerialTL.chipLink(phitWidth = 32, flitWidth = 32))))
 
 /** Port 0 to our own testchip, port 1 to the peer FPGA (C2C bringup). */
 class WithSophiaLakeC2CSerialTL extends Config(
@@ -115,10 +119,22 @@ class SophiaLakeDSP25Config extends Config(
   new WithDSP25SophiaLakeSerialTLToGPIO ++
   new WithSophiaLakeChipSerialTL ++
   new SophiaLakeConfig(freqMHz = 50))
-
+  
 class SophiaLakeDSP25C2CConfig extends Config(
   new WithDSP25C2CSophiaLakeSerialTLToGPIO ++
   new WithSophiaLakeC2C(scratchpadBase = BigInt("c0000000", 16)))
+
+
+
+// ---------------------------------------------------------
+// FA26
+// ---------------------------------------------------------
+
+/** Select with SophiaLakeHarness for the FA26 32-bit pinout. */
+class SophiaLakeFA26Config extends Config(
+  new WithFA26SophiaLakeSerialTLToGPIO ++
+  new WithSophiaLakeFA26ChipSerialTL ++
+  new SophiaLakeConfig(freqMHz = 50))
 
 
 // ---------------------------------------------------------
