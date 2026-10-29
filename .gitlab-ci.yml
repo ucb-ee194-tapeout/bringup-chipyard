@@ -1,0 +1,2413 @@
+spec:
+  inputs:
+    TestSuitePath:
+      description: "Path of the Test Suite from the Chipyard Repo ROOT. EXAMPLE -> CI_CD_TEST_SUITES/saturn"
+      default: "CI_CD_TEST_SUITES/nightly"
+    Config:
+      description: "Hammer config to use for syn and par (e.g. EE290TapeoutConfig)"
+      default: "EE290TapeoutConfig"
+    RUN_PD:
+      description: "Whether pipeline should run syn, par, etc."
+      default: "false"
+
+---
+variables:
+  TZ: "America/Los_Angeles"
+
+.script_helpers: &script_helpers |
+  export PS4="+ CMD: "
+  start_section() { 
+    local safe_id="${1//[^a-zA-Z0-9_]/_}"
+    printf "\e[0Ksection_start:%s:%s[collapsed=true]\r\e[0K%s\n" "$(date +%s)" "$safe_id" "$2"
+    set -x
+  }
+  end_section() { 
+    { set +x; } 2>/dev/null
+    local safe_id="${1//[^a-zA-Z0-9_]/_}"
+    printf "\e[0Ksection_end:%s:%s\r\e[0K\n" "$(date +%s)" "$safe_id"
+  }
+
+stages:
+  - security-check
+  - build
+  - test
+  - par
+  - drc
+  - metrics
+  - notify
+  - clean
+
+workflow:
+  rules:
+    # MR pipelines: Assign a lock based on the target branch.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      variables:
+        CONCURRENCY_GROUP: "mr_target_${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+
+    # Scheduled Nightly pipelines (PD ENABLED)
+    # Locks to a single group so only ONE PD pipeline can run at a time
+    - if: $CI_PIPELINE_SOURCE == "schedule" && "$[[ inputs.RUN_PD ]]" == "true"
+      variables:
+        CONCURRENCY_GROUP: "nightly_pd_lock"
+
+    # Scheduled Nightly pipelines (PD DISABLED)
+    # Generates a unique group ID per pipeline
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      variables:
+        CONCURRENCY_GROUP: "nightly_${CI_PIPELINE_ID}"
+
+    - if: $CI_PIPELINE_SOURCE == "web"
+      variables:
+        CONCURRENCY_GROUP: "manual_${CI_PIPELINE_ID}"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ------------------------------------------------------------------
+#                     SECURITY CHECK
+# ------------------------------------------------------------------
+
+enforce_ci_integrity:
+  interruptible: true
+  stage: security-check
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    ALLOWED_CI_MODIFIERS: "bandk1451 yrh nicorakela syeon-um henry.wilson"
+    GIT_DEPTH: 0
+  script:
+    - echo "Pipeline triggered by user:$GITLAB_USER_LOGIN"
+    - |
+      if echo " $ALLOWED_CI_MODIFIERS " | grep -q " $GITLAB_USER_LOGIN "; then
+        echo "${GITLAB_USER_LOGIN} is authorized to modify CI and Nightly tests. Moving on..."
+        exit 0
+      fi
+    - echo "${GITLAB_USER_LOGIN} is not authorized to edit CI/Nightly tests. Checking for unauthorized modifications..."
+    - git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+    
+    - CHANGED_FILES=$(git diff --name-only origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME...HEAD)
+    - |
+      if echo "$CHANGED_FILES" | grep -q "^\.gitlab-ci\.yml$"; then
+        echo "ERROR: User $GITLAB_USER_LOGIN is not allowed to modify .gitlab-ci.yml in a Merge Request!"
+        exit 1
+      fi
+
+    - |
+      DELETED_CONFS=$(git diff --name-only --diff-filter=D origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME...HEAD -- CI_CD_TEST_SUITES/nightly | grep "\.conf$" || true)
+      if [ ! -z "$DELETED_CONFS" ]; then
+        echo "ERROR: The following .conf files have been completely deleted from the nightly suite!"
+        echo "$DELETED_CONFS"
+        exit 1
+      fi      
+
+    - |
+      # Get a list of modified .conf files (excluding deletions which we already caught)
+      MODIFIED_CONFS=$(git diff --name-only --diff-filter=M origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME...HEAD -- CI_CD_TEST_SUITES/nightly | grep "\.conf$" || true)
+      
+      for conf_file in $MODIFIED_CONFS; do
+        echo "Verifying test integrity in $conf_file..."
+        
+        OLD_TESTS=$(git show origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME:$conf_file | grep -v "=" | grep -oP '"\K[^"]+')
+        
+        NEW_TESTS=$(cat $conf_file | grep -v "=" | grep -oP '"\K[^"]+')
+        
+        for test in $OLD_TESTS; do
+          # -F: fixed strings, -q: quiet, -x: exact line match
+          # This ensures we don't accidentally match "vec-conv" inside "vec-conv-3"
+          if ! echo "$NEW_TESTS" | grep -Fqx "$test"; then
+            echo "ERROR: Test or configuration value '$test' has been removed from $conf_file!"
+            exit 1
+          fi
+        done
+      done
+
+    - echo "CI configuration and Nightly tests are secure. Proceeding with the pipeline..."
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ------------------------------------------------------------------
+#                           BUILD
+# ------------------------------------------------------------------
+
+build:
+  interruptible: true
+  stage: build
+  script: 
+    - *script_helpers
+    - echo $CONCURRENCY_GROUP
+    - export chipyard=/tools/C/$USER/CI_CD_${CI_PIPELINE_ID}
+    - export TARGET_BRANCH="${CI_COMMIT_BRANCH:-$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME}"
+    - source ~/miniforge3/bin/activate
+    - source /tools/C/ee194-sp26/bwrc-env.sh
+    - |
+
+      if [ -d "${chipyard}" ]; then
+        CLEANUP_DIR="/tools/C/$USER/TEMP_RM_DIR_${CI_PIPELINE_ID}_${CI_JOB_ID}"
+        echo "WARNING:Existing CI_CD found. Moving to ${CLEANUP_DIR} for removal..."
+        mv "${chipyard}" "${CLEANUP_DIR}"
+        
+        rm -rf "${CLEANUP_DIR}"
+      fi
+
+      start_section "ScratchBuild" "Building CI_CD from scratch...."
+      cd /tools/C/$USER
+      # Redacted: the internal repository URL, PDK group, and PDK plugin are replaced with <internal-chipyard-repo>, <pdk-group>, and <pdk-plugin>, so this job does not run as is.
+      git clone <internal-chipyard-repo> ${chipyard}
+      chown -R ${USER}:<pdk-group> $chipyard
+      find $chipyard -type d -exec chmod g+s {} +
+      cd $chipyard
+      ./build-setup.sh --use-lean-conda -s 6 -s 7 -s 8 -s 9
+      source ./env.sh
+      cd vlsi
+      rm -rf hammer
+      git clone git@github.com:ucb-bar/hammer.git
+      pip install -e hammer
+      cd ..
+      git submodule update --init --recursive vlsi/<pdk-plugin>
+      cd vlsi/<pdk-plugin>
+      pip install -e .
+      cd ../../
+      cd vlsi/<pdk-plugin>
+      git checkout master
+      cd $chipyard
+      git submodule deinit -f generators/radiance/
+      end_section "ScratchBuild"
+      
+      cd $chipyard
+      source ./env.sh
+      
+      ROOT_SKIP_PATHS="generators/ara software toolchains tools fpga generators/radiance generators/gemmini generators/cva6"
+      echo "SKIPPING PATHS:${ROOT_SKIP_PATHS}"
+      
+      NESTED_BROKEN_MODS="generators/gemmini/MxQuant-hardware"
+      echo "SKIPPING BROKEN MODULES:${NESTED_BROKEN_MODS}"
+      
+      start_section "Fetching" "FETCHING..."
+      git fetch --all
+      end_section "Fetching"
+
+      start_section "Branch_Checkout" "Checking out branch:${TARGET_BRANCH}"
+      git checkout ${TARGET_BRANCH}
+      end_section "Branch_Checkout"
+
+      start_section "Overall_Reset" "RESETTING..."
+      git reset --hard origin/${TARGET_BRANCH}
+      end_section "Overall_Reset"
+      
+      start_section "Overall_Clean" "CLEANING..."
+      git clean -df
+      end_section "Overall_Clean"
+
+      start_section "Fix_Broken_Nested_Submodules" "DISABLING BROKEN MODS..."
+      for mod in $NESTED_BROKEN_MODS; do
+        PARENT=$(dirname "$mod")
+        CHILD=$(basename "$mod")
+        
+        git submodule update --init "$PARENT"
+        SUB_NAME=$(git -C "$PARENT" config -f .gitmodules --get-regexp "^submodule\..*\.path$" "^${CHILD}$" | awk '{print $1}' | sed 's/^submodule\.//;s/\.path$//' | head -n 1) || true
+        if [ -z "$SUB_NAME" ]; then
+          SUB_NAME="$CHILD"
+        fi
+        
+        git -C "$PARENT" config -f .gitmodules submodule."$SUB_NAME".url "https://dummy.local/repo.git" || true
+        git -C "$PARENT" config submodule."$SUB_NAME".update none || true
+        { set +x; } 2>/dev/null
+        echo "Patched URL and disabled updates for nested broken module: $mod"
+        set -x
+      done
+      end_section "Fix_Broken_Nested_Submodules"
+      
+      start_section "Disabling_Skip_Paths" "DISABLING SKIP PATHS..."
+      for prefix in $ROOT_SKIP_PATHS; do
+        git config --file .gitmodules --get-regexp path | grep -E " ${prefix}(/|$)" | awk '{print $1}' | sed 's/\.path$//' | while read -r submod_key; do
+          git config "$submod_key.update" none
+          { set +x; } 2>/dev/null
+          echo "Disabled update for root submodule: $submod_key"
+          set -x
+        done
+      done
+      end_section "Disabling_Skip_Paths"
+
+      start_section "Inner_Reset_And_Clean" "RESETTING AND CLEANING..."
+      ALL_SKIP_PREFIXES="$ROOT_SKIP_PATHS $NESTED_BROKEN_MODS"
+      git submodule foreach --recursive '
+        SKIP=0
+        for prefix in '"$ALL_SKIP_PREFIXES"'; do
+          case "$displaypath" in
+            $prefix*) SKIP=1 ;;
+          esac
+        done
+        
+        if [ $SKIP -eq 1 ]; then
+          { set +x; } 2>/dev/null
+          echo "Skipping reset and clean for $displaypath"
+          set -x
+        else
+          git reset --hard
+          git clean -df 
+          
+          for mod in '"$NESTED_BROKEN_MODS"'; do
+            PARENT=$(dirname "$mod")
+            CHILD=$(basename "$mod")
+            if [ "$PARENT" = "$displaypath" ]; then
+              git config -f .gitmodules submodule."$CHILD".path "$CHILD"
+              git config -f .gitmodules submodule."$CHILD".url "https://dummy.local/repo.git"
+              { set +x; } 2>/dev/null
+              echo "Re-patched URL for $CHILD in $PARENT after reset"
+              set -x
+            fi
+          done
+        fi
+      '
+      end_section "Inner_Reset_And_Clean"
+
+      start_section "Fix_Tacit" "Explicitly updating tacit submodule..."
+      git submodule update --init generators/tacit
+      end_section "Fix_Tacit"
+
+      start_section "Force_Submodule_Update" "FORCING SUBMODULE UPDATES..."
+      git submodule update --init --recursive --force
+      end_section "Force_Submodule_Update"
+      
+      start_section "Revert_Configurations" "REVERTING SKIPPED CONFIGS..."
+      for prefix in $ROOT_SKIP_PATHS; do
+        git config --file .gitmodules --get-regexp path | grep -E " ${prefix}(/|$)" | awk '{print $1}' | sed 's/\.path$//' | while read -r submod_key; do
+          git config --unset "$submod_key.update" || true
+        done
+      done
+      
+      for mod in $NESTED_BROKEN_MODS; do
+        PARENT=$(dirname "$mod")
+        CHILD=$(basename "$mod")
+        git -C "$PARENT" reset HEAD "$CHILD" 2>/dev/null || true
+        git -C "$PARENT" checkout -- "$CHILD" 2>/dev/null || true
+        { set +x; } 2>/dev/null
+        echo "Restored $CHILD in $PARENT index"
+        set -x
+      done
+      end_section "Revert_Configurations"
+      
+      echo "BUILD FINISHED..."
+      pwd
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ------------------------------------------------------------------
+#                     TEST EXECUTION
+# ------------------------------------------------------------------
+
+test_execution:
+  interruptible: true
+  stage: test
+  resource_group: sim_${CONCURRENCY_GROUP}
+  script:
+    - *script_helpers
+    - BUILD_DIR=$(pwd)
+    - export chipyard=/tools/C/$USER/CI_CD_${CI_PIPELINE_ID}
+    - export TARGET_BRANCH="${CI_COMMIT_BRANCH:-$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME}"
+    - source ${chipyard}/scripts/CI_CD/setup_CI_CD.sh
+    - TODAY=$(date +"%Y-%m-%d")
+    - TEST_SUMMARY_LOG=${BUILD_DIR}/log_${TODAY}_${TARGET_BRANCH}.txt
+    - JUNIT_XML=${BUILD_DIR}/junit_report.xml
+
+    - export RANDOM_SEED=$((RANDOM * 32768 + RANDOM))
+    - echo "Generated Pipeline Random Seed:${RANDOM_SEED}"
+    
+    - echo "log from project:${CI_PROJECT_PATH}, branch:${TARGET_BRANCH}, job_url:${CI_JOB_URL}" > $TEST_SUMMARY_LOG
+    - echo "RANDOM_SEED:${RANDOM_SEED}" >> $TEST_SUMMARY_LOG
+    - echo "---------------------------------------" >> $TEST_SUMMARY_LOG
+    - echo "TEST SUMMARY" >> $TEST_SUMMARY_LOG
+    - echo "---------------------------------------" >> $TEST_SUMMARY_LOG
+    - echo '<?xml version="1.0" encoding="UTF-8"?><testsuites>' > $JUNIT_XML
+
+    - pip install torch
+    - pip install numba torch
+
+    - |
+
+      TS_PATH="${chipyard}/$[[ inputs.TestSuitePath ]]"
+      if [ ! -d "$TS_PATH" ]; then
+        echo "Error: Directory $TS_PATH does not exist."
+        exit 1
+      fi
+
+      CONFIGS=($(ls -1 "$TS_PATH"))
+      echo "Found configs:${CONFIGS[@]}"
+      mkdir -p $BUILD_DIR/run_logs
+
+      # =========================================================================
+      # PHASE 1: PREP AND BUILD THE JOB QUEUE
+      # =========================================================================
+      start_section "Phase_1" "SETUP COMPLETE. BEGINNING PHASE 1 JOB QUEUEING"
+
+      JOB_QUEUE=()
+      
+      for conf in "${CONFIGS[@]}"; do
+        set -a; source "${chipyard}/$[[ inputs.TestSuitePath ]]/${conf}"; set +a
+
+        if ! grep -q "HW_CONFIG" ${chipyard}/$[[ inputs.TestSuitePath ]]/${conf}; then exit 1; fi
+        if ! grep -q "TEST_DIR" ${chipyard}/$[[ inputs.TestSuitePath ]]/${conf}; then exit 1; fi
+        if ! grep -q "TEST_TYPE" ${chipyard}/$[[ inputs.TestSuitePath ]]/${conf}; then exit 1; fi
+        if ! grep -q "SIM_DIR" ${chipyard}/$[[ inputs.TestSuitePath ]]/${conf}; then exit 1; fi
+        if ! grep -q "TESTS" ${chipyard}/$[[ inputs.TestSuitePath ]]/${conf}; then exit 1; fi
+        
+        if [ "${TEST_TYPE}" == "baremetal" ]; then
+          start_section "Build_And_Queue_${conf}" "Pre-building ${HW_CONFIG} and tests for ${conf}..."
+          (cd ${chipyard}/${TEST_DIR} && make)
+          
+          (cd ${chipyard}/${SIM_DIR} && flock ${chipyard}/.scala_build.lock -c "make -j16 CONFIG=\"${HW_CONFIG}\" GEN_COVERAGE=1 LOADMEM=1 BINARY=base_schema debug")
+          
+          { set +x; } 2>/dev/null
+          if [ ${#TESTS[@]} -gt 0 ]; then
+            FIRST_TEST="${TESTS[0]}"
+            echo "Warming up caches sequentially with first test: ${FIRST_TEST}..."
+            (
+              set -x
+              cd ${chipyard}/${SIM_DIR}
+              make -j1 GEN_COVERAGE=1 LOADMEM=1 \
+                CONFIG="${HW_CONFIG}" \
+                BINARY="${chipyard}/${TEST_DIR}/${FIRST_TEST}.riscv" \
+                run-binary-debug \
+                SIM_FLAGS="-no-save -debug_access+all -u" \
+                < /dev/null > /dev/null 2>&1 || true
+            )
+          fi
+
+          { set +x; } 2>/dev/null
+          echo "Queueing baremetal tests for ${conf}..."
+          for test in "${TESTS[@]}"; do
+            set -x
+            JOB_QUEUE+=("1|baremetal|${conf}|${test}")
+          done
+          end_section "Build_And_Queue_${conf}"
+
+        elif [ "${TEST_TYPE}" == "chisel" ]; then
+          { set +x; } 2>/dev/null
+          echo "Pre-building and queueing chisel tests for ${conf}..."
+          set -x
+          cd ${chipyard}/${TEST_DIR}
+
+          mkdir -p src/test/resources
+          
+          for file in scripts/*.py; do 
+            python3 "$file"
+          done
+
+          JOB_QUEUE+=("16|chisel|${conf}|${TESTS[*]}")
+        
+        else
+          echo "ERROR:TEST_TYPE INVALID IN ${conf}"
+          exit 1
+        fi
+      done
+      end_section "Phase_1"
+
+      # =========================================================================
+      # PHASE 2: DYNAMIC THREAD SCHEDULER (MAX 35 THREADS)
+      # =========================================================================
+      start_section "Phase_2" "PHASE 1 COMPLETE. BEGINNING PHASE 2 DYNAMIC PARALLEL EXECUTION"
+
+      MAX_THREADS=35
+      declare -A RUNNING_PIDS
+
+      for job in "${JOB_QUEUE[@]}"; do
+        { set +x; } 2>/dev/null
+        IFS='|' read -r weight type conf job_tests <<< "$job"
+        
+        while true; do
+          CURRENT_THREADS=0
+          for pid in "${!RUNNING_PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+              CURRENT_THREADS=$((CURRENT_THREADS + RUNNING_PIDS[$pid]))
+            else
+              wait "$pid" 2>/dev/null || true
+              unset RUNNING_PIDS[$pid]
+            fi
+          done
+          
+          if [ $((CURRENT_THREADS + weight)) -le $MAX_THREADS ]; then
+            
+            LICENSES_OK=false
+            
+            LICENSE_OUTPUT=$('/tools/synopsys/flexlm/status' 2>/dev/null | tr -d '\r' | awk '/Users of/ {if(line) print line; line=$0; next} NF==0 {next} line {line=line" "$0} END {if(line) print line}' | grep -i "vcs")
+            
+            if [ -n "$LICENSE_OUTPUT" ]; then
+              LICENSES_OK=true
+              FOUND_VALID_COUNT=false
+              
+              re="Total of ([0-9]+) licenses? issued; +Total of ([0-9]+) licenses? in use"
+              
+              while IFS= read -r line; do
+                if [[ "$line" =~ $re ]]; then
+                  FOUND_VALID_COUNT=true
+                  issued="${BASH_REMATCH[1]}"
+                  in_use="${BASH_REMATCH[2]}"
+                  available=$((issued - in_use))
+                  
+                  if [ "$available" -lt 25 ]; then
+                    LICENSES_OK=false
+                    break
+                  fi
+                fi
+              done <<< "$LICENSE_OUTPUT"
+
+              if [ "$FOUND_VALID_COUNT" = false ]; then
+                LICENSES_OK=false
+              fi
+            fi
+
+            if [ "$LICENSES_OK" = true ]; then
+              break
+            fi
+          fi
+          
+          sleep 30
+        done
+        
+        set -a; source "${chipyard}/$[[ inputs.TestSuitePath ]]/${conf}"; set +a
+
+        if [ "$type" == "baremetal" ]; then
+          test="$job_tests"
+          echo "Dispatching $type job $test from $conf (Threads: $weight) | Active Threads: $((CURRENT_THREADS + weight))/$MAX_THREADS"
+          (
+            echo
+            RUN_DIR="${BUILD_DIR}/run_dirs/run_${conf}_${test}"
+            mkdir -p "$RUN_DIR"
+            cd "$RUN_DIR"
+
+            SECONDS=0
+            START_TS=$(date +%s)
+            LOG_FILE="${BUILD_DIR}/run_logs/run_${conf}_${test}.log"
+            SUMMARY_FILE="${BUILD_DIR}/run_logs/summary_tmp_${conf}_${test}.txt"
+            JUNIT_FILE="${BUILD_DIR}/run_logs/junit_tmp_${conf}_${test}.xml"
+            OUT="${chipyard}/${SIM_DIR}/output/chipyard.harness.TestHarness.${HW_CONFIG}/${test}.out"
+            FSDB="${RUN_DIR}/${test}.fsdb"
+            COVERAGE="${chipyard}/${SIM_DIR}/generated-src/chipyard.harness.TestHarness.${HW_CONFIG}/coverage/${test}.vdb"
+            RISCV="${chipyard}/${TEST_DIR}/${test}.riscv"
+            
+            set -x
+            SIM_BIN="${chipyard}/${SIM_DIR}/simv-chipyard.harness-${HW_CONFIG}-debug"
+
+            SIM_EXIT=0
+            timeout -s SIGINT 3h $SIM_BIN \
+              +permissive \
+              +ntb_random_seed=${RANDOM_SEED} \
+              +dramsim \
+              +dramsim_ini_dir=${chipyard}/generators/testchipip/src/main/resources/dramsim2_ini \
+              +max-cycles=50000000 \
+              +verbose \
+              ${FSDB_ARG} \
+              +loadmem="${RISCV}" \
+              -cm line+cond+fsm+branch+tgl+assert \
+              -cm_name ${test} \
+              -cm_dir ${COVERAGE} \
+              +permissive-off \
+              ${RISCV} < /dev/null 2> >(spike-dasm > "${OUT}") > "${LOG_FILE}" || SIM_EXIT=$?
+
+
+            if { [ $SIM_EXIT -ne 0 ] || ! grep -Eq "PASSED" "$OUT" 2>/dev/null; }; then
+              if [ "$CI_PIPELINE_SOURCE" == "schedule" ]; then
+                { set +x; } 2>/dev/null
+                echo "Test ${test} failed. Rerunning with FSDB generation enabled..."
+                set -x
+                
+                FSDB_ARG="+fsdbfile=${test}.fsdb"
+                SIM_EXIT=0
+                
+                timeout -s SIGINT 3h $SIM_BIN \
+                  +permissive \
+                  +ntb_random_seed=${RANDOM_SEED} \
+                  +dramsim \
+                  +dramsim_ini_dir=${chipyard}/generators/testchipip/src/main/resources/dramsim2_ini \
+                  +max-cycles=50000000 \
+                  +verbose \
+                  ${FSDB_ARG} \
+                  +loadmem="${RISCV}" \
+                  -cm line+cond+fsm+branch+tgl+assert \
+                  -cm_name ${test} \
+                  -cm_dir ${COVERAGE} \
+                  +permissive-off \
+                  ${RISCV} < /dev/null 2> >(spike-dasm > "${OUT}") > "${LOG_FILE}" || SIM_EXIT=$?
+              fi
+            fi
+
+            
+            END_TS=$(date +%s)
+
+            { set +x; } 2>/dev/null
+
+            sed -i 's/\x1B\[[0-9;]*[a-zA-Z]//g' "$LOG_FILE"
+            echo "Completed $type job $test from $conf"
+
+            if [ $SIM_EXIT -eq 124 ]; then
+              echo "  [ FAIL ] ${test}      Duration:${SECONDS} (TIMEOUT)" > "$SUMMARY_FILE"
+              echo "<testcase name=\"${test}\" classname=\"${conf}\" time=\"${SECONDS}\"><properties><property name=\"start_ts\" value=\"${START_TS}\"/><property name=\"end_ts\" value=\"${END_TS}\"/></properties><failure message=\"Test timed out after 3 hours\">Check artifacts:run_logs/run_${conf}_${test}.log</failure></testcase>" > "$JUNIT_FILE"
+              [ -f "${FSDB}" ] && mv ${FSDB} ${BUILD_DIR}/run_logs/ 2>/dev/null || true
+            elif [ $SIM_EXIT -ne 0 ]; then
+              echo "  [ ERROR ] ${test}      Duration:${SECONDS}" > "$SUMMARY_FILE"
+              echo "<testcase name=\"${test}\" classname=\"${conf}\" time=\"${SECONDS}\"><properties><property name=\"start_ts\" value=\"${START_TS}\"/><property name=\"end_ts\" value=\"${END_TS}\"/></properties><failure message=\"Test errored\">Check artifacts:run_logs/run_${conf}_${test}.log</failure></testcase>" > "$JUNIT_FILE"
+              [ -f "${FSDB}" ] && mv ${FSDB} ${BUILD_DIR}/run_logs/ 2>/dev/null || true
+            else
+              if [ $SIM_EXIT -eq 0 ] && [ -f "$OUT" ] && grep -Eq "PASSED" "$OUT"; then
+                echo "  [ PASS ] ${test}      Duration:${SECONDS}" > "$SUMMARY_FILE"
+                echo "<testcase name=\"${test}\" classname=\"${conf}\" time=\"${SECONDS}\"><properties><property name=\"start_ts\" value=\"${START_TS}\"/><property name=\"end_ts\" value=\"${END_TS}\"/></properties></testcase>" > "$JUNIT_FILE"
+              else
+                echo "  [ FAIL ] ${test}      Duration:${SECONDS}" > "$SUMMARY_FILE"
+                echo "<testcase name=\"${test}\" classname=\"${conf}\" time=\"${SECONDS}\"><properties><property name=\"start_ts\" value=\"${START_TS}\"/><property name=\"end_ts\" value=\"${END_TS}\"/></properties><failure message=\"Test failed\">Check artifacts:run_logs/run_${conf}_${test}.log</failure></testcase>" > "$JUNIT_FILE"
+                [ -f "${FSDB}" ] && mv ${FSDB} ${BUILD_DIR}/run_logs/
+              fi
+            fi
+            set -x
+          ) &
+          RUNNING_PIDS[$!]=${weight} 
+
+        elif [ "$type" == "chisel" ]; then
+          { set +x; } 2>/dev/null
+          echo "Dispatching $type jobs from $conf (Threads: $weight) | Active Threads: $((CURRENT_THREADS + weight))/$MAX_THREADS"
+          set -x
+          (
+            cd ${chipyard}/${SIM_DIR}
+            export PATH="$PATH:$(pwd)"
+            SECONDS=0
+            START_TS=$(date +%s)
+            
+            MILL_TARGETS="atlas.test.testOnly"
+            for t in $job_tests; do
+              MILL_TARGETS="${MILL_TARGETS} ${HW_CONFIG}.${t}"
+            done
+
+            COMBINED_LOG="${BUILD_DIR}/run_logs/run_${conf}_combined.log"
+            MILL_EXIT=0
+
+            timeout 3h ./mill --no-server --disable-ticker -k -j16 $MILL_TARGETS > "$COMBINED_LOG" 2>&1 || MILL_EXIT=$?
+            END_TS=$(date +%s)
+
+            { set +x; } 2>/dev/null
+
+            sed -i 's/\x1B\[[0-9;]*[a-zA-Z]//g' "$COMBINED_LOG"
+            echo "Completed $type jobs from $conf"
+
+            SUMMARY_FILE="${BUILD_DIR}/run_logs/summary_tmp_${conf}_chisel.txt"
+            JUNIT_FILE="${BUILD_DIR}/run_logs/junit_tmp_${conf}_chisel.xml"
+            > "$SUMMARY_FILE"
+            > "$JUNIT_FILE"
+
+            echo "Chisel Test Suite Duration:${SECONDS}" >> "$SUMMARY_FILE"
+            
+            for t in $job_tests; do
+              if [ -f "$COMBINED_LOG" ] && grep -Eq "${t}=FAILED" "$COMBINED_LOG"; then
+                echo "  [ FAIL ] ${t}" >> "$SUMMARY_FILE"
+                echo "<testcase name=\"${t}\" classname=\"${conf}\" time=\"${SECONDS}\"><properties><property name=\"start_ts\" value=\"${START_TS}\"/><property name=\"end_ts\" value=\"${END_TS}\"/></properties><failure message=\"Test failed\">Check artifacts:run_logs/run_${conf}_combined.log</failure></testcase>" >> "$JUNIT_FILE"
+              elif [ -f "$COMBINED_LOG" ] && grep -Eq "${t}=PASSED" "$COMBINED_LOG"; then
+                echo "  [ PASS ] ${t}" >> "$SUMMARY_FILE"
+                echo "<testcase name=\"${t}\" classname=\"${conf}\" time=\"${SECONDS}\"><properties><property name=\"start_ts\" value=\"${START_TS}\"/><property name=\"end_ts\" value=\"${END_TS}\"/></properties></testcase>" >> "$JUNIT_FILE"
+              else
+                echo "  [ ERROR ] ${t}" >> "$SUMMARY_FILE"
+                echo "<testcase name=\"${t}\" classname=\"${conf}\" time=\"${SECONDS}\"><properties><property name=\"start_ts\" value=\"${START_TS}\"/><property name=\"end_ts\" value=\"${END_TS}\"/></properties><failure message=\"Test errored\">Check artifacts:run_logs/run_${conf}_combined.log</failure></testcase>" >> "$JUNIT_FILE"
+              fi
+            done
+            set -x
+          ) &
+          RUNNING_PIDS[$!]=$weight 
+        fi
+      done
+
+      { set +x; } 2>/dev/null
+      for pid in "${!RUNNING_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+      done
+      set -x
+
+      end_section "Phase_2"
+
+      # =========================================================================
+      # PHASE 3: AGGREGATE RESULTS
+      # =========================================================================
+      start_section "Phase_3" "PHASE 2 COMPLETE. BEGINNING PHASE 3 AGGREGATION"
+
+      FAIL=0
+
+      { set +x; } 2>/dev/null
+      for conf in "${CONFIGS[@]}"; do
+        set -a; source "${chipyard}/$[[ inputs.TestSuitePath ]]/${conf}"; set +a
+        
+        echo -e "\n\nTestSuite:${conf}\nHardware Config:${HW_CONFIG}\nTEST_TYPE:${TEST_TYPE}" >> $TEST_SUMMARY_LOG
+        echo "<testsuite name=\"${conf}\">" >> $JUNIT_XML
+
+        for tmp_sum in ${BUILD_DIR}/run_logs/summary_tmp_${conf}_*.txt; do
+          if [ -f "$tmp_sum" ]; then
+            cat "$tmp_sum" >> $TEST_SUMMARY_LOG
+            if grep -q "\[ FAIL \]" "$tmp_sum"; then FAIL=1; fi
+            if grep -q "\[ ERROR \]" "$tmp_sum"; then FAIL=1; fi
+          fi
+        done
+
+        for tmp_xml in ${BUILD_DIR}/run_logs/junit_tmp_${conf}_*.xml; do
+          if [ -f "$tmp_xml" ]; then
+            cat "$tmp_xml" >> $JUNIT_XML
+          fi
+        done
+
+        if [ "${TEST_TYPE}" == "chisel" ]; then
+          set -x
+          cd ${chipyard}/${SIM_DIR}/tmp
+          echo "aggregrate chisel coverage"
+          VDB_DIRS=""
+          for test_name in "${TESTS[@]}"; do
+            for vdb_path in ${test_name}*/workdir-${test_name}*/coverage.vdb; do
+              if [ -d "$vdb_path" ]; then
+                VDB_DIRS="${VDB_DIRS} ${vdb_path}"
+              else
+                echo "Warning: Coverage directory not found -> ${vdb_path}"
+              fi
+            done
+          done
+          
+          if [ -n "$VDB_DIRS" ]; then
+            urg -dir $VDB_DIRS -format text -report "${BUILD_DIR}/run_logs/cov_overall_${conf}" || echo "Coverage generation failed"
+          else
+            echo "No coverage data to aggregate for ${conf}"
+          fi
+          { set +x; } 2>/dev/null
+        elif [ "${TEST_TYPE}" == "baremetal" ]; then
+          set -x
+          cd ${chipyard}/${SIM_DIR}/generated-src/chipyard.harness.TestHarness.${HW_CONFIG}
+          urg -dir coverage/*.vdb -format text -report ${BUILD_DIR}/run_logs/cov_overall_${HW_CONFIG} || echo "Coverage generation failed"
+          { set +x; } 2>/dev/null
+        fi
+        
+        echo "</testsuite>" >> $JUNIT_XML
+      done
+
+      echo "</testsuites>" >> ${JUNIT_XML}
+
+      echo "" >> $TEST_SUMMARY_LOG
+      echo "" >> $TEST_SUMMARY_LOG
+      rm -rf ${BUILD_DIR}/run_logs/junit_tmp*.xml
+      rm -rf ${BUILD_DIR}/run_logs/summary_tmp*.txt
+      if [ "${FAIL}" -ne 0 ]; then
+        echo "[ OVERALL STATUS -> FAILED ]" >> $TEST_SUMMARY_LOG
+        exit 1
+      else
+        echo "[ OVERALL STATUS -> PASSED ]" >> $TEST_SUMMARY_LOG
+      fi
+
+      set -x
+
+      end_section "Phase_3"
+
+      echo "TEST EXECUTION FINISHED"
+
+  artifacts:
+      when: always
+      paths:
+        - log_*.txt
+        - run_logs/
+        - junit_report.xml
+      reports:
+        junit: junit_report.xml 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ------------------------------------------------------------------
+#                             PD STUFF
+# ------------------------------------------------------------------
+
+synthesis:
+  interruptible: false
+  stage: test
+  resource_group: ${CONCURRENCY_GROUP}
+  rules:
+    - if: '"$[[ inputs.RUN_PD ]]" == "true"'
+  script:
+    - *script_helpers
+    - WORKSPACE=$(pwd)
+    - echo "STEP workspace=${WORKSPACE}"
+    - export chipyard=/tools/C/$USER/CI_CD_${CI_PIPELINE_ID}
+    - export BUILD_ROOT=${chipyard}/vlsi/build
+    - cd $chipyard
+    - source ~/miniforge3/bin/activate
+    - source ./env.sh
+    - source /tools/C/ee194-sp26/bwrc-env.sh
+    - LAST_SUCCESSFUL_PAR="/tools/C/$USER/pd-archives/last_successful_par.txt"
+    - CONFIG_DIR="chipyard.harness.TestHarness.$[[ inputs.Config ]]-ChipTop"
+    - SYN_RUNDIR="${BUILD_ROOT}/${CONFIG_DIR}/syn-rundir"
+    - echo "STEP SYN_RUNDIR=${SYN_RUNDIR}"
+    - mkdir -p ${WORKSPACE}/syn-rundir
+    - |
+      LAST_COMMIT=$(awk '{print $1}' ${LAST_SUCCESSFUL_PAR} 2>/dev/null || echo "none")
+      if [ "$CI_PIPELINE_SOURCE" != "merge_request_event" ] && [ "$LAST_COMMIT" == "$CI_COMMIT_SHA" ]; then
+        echo "No new commits since last successful nightly (${CI_COMMIT_SHA}). Nothing to do."
+      else
+        echo "Cleaning build directory for fresh run..."
+        cd ${chipyard}/vlsi
+        echo "Starting synthesis — Config:$[[ inputs.Config ]] Branch:${CI_COMMIT_BRANCH} Commit:${CI_COMMIT_SHA}"
+        cd ${chipyard}/vlsi
+        SECONDS=0
+        mkdir -p ${WORKSPACE}/syn-rundir
+        flock ${chipyard}/.scala_build.lock -c "make CONFIG=$[[ inputs.Config ]] verilog"
+        make CONFIG=$[[ inputs.Config ]] syn 2>&1 | tee ${WORKSPACE}/syn-rundir/make_syn.log
+        test ${PIPESTATUS[0]} -eq 0
+        echo $SECONDS > ${WORKSPACE}/syn-rundir/syn_runtime.txt
+        echo "Synthesis complete. Runtime:${SECONDS}s"
+
+        # Copy reports and logs to workspace
+        echo "STEP copying reports and logs to workspace..."
+        mkdir -p ${WORKSPACE}/syn-rundir/reports
+        cp -r ${SYN_RUNDIR}/reports/. ${WORKSPACE}/syn-rundir/reports/ || true
+        cp ${SYN_RUNDIR}/genus.log ${WORKSPACE}/syn-rundir/ || true
+        cp ${SYN_RUNDIR}/syn-output.json ${WORKSPACE}/syn-rundir/ || true
+        cp ${SYN_RUNDIR}/syn-output-full.json ${WORKSPACE}/syn-rundir/ || true
+        echo "STEP all copies done"
+      fi
+
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" == "failed" ]; then
+        WORKSPACE=$(pwd)
+        BUILD_ROOT=/tools/C/$USER/CI_CD_${CI_PIPELINE_ID}/vlsi/build
+        CONFIG_DIR="chipyard.harness.TestHarness.$[[ inputs.Config ]]-ChipTop"
+        SYN_RUNDIR="${BUILD_ROOT}/${CONFIG_DIR}/syn-rundir"
+        mkdir -p ${WORKSPACE}/syn-rundir/reports
+        cp -r ${SYN_RUNDIR}/reports/. ${WORKSPACE}/syn-rundir/reports/ 2>/dev/null || true
+        cp ${SYN_RUNDIR}/genus.log ${WORKSPACE}/syn-rundir/ 2>/dev/null || true
+        echo "Synthesis FAILED — Config:$[[ inputs.Config ]] Branch:${CI_COMMIT_BRANCH} Commit:${CI_COMMIT_SHA}" > ${WORKSPACE}/syn-rundir/syn_FAILED.txt
+        echo "Job URL: ${CI_JOB_URL}" >> ${WORKSPACE}/syn-rundir/syn_FAILED.txt
+      fi
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - "syn-rundir/reports/"
+      - "syn-rundir/genus.log"
+      - "syn-rundir/make_syn.log"
+      - "syn-rundir/syn-output.json"
+      - "syn-rundir/syn-output-full.json"
+      - "syn-rundir/syn_runtime.txt"
+      - "syn-rundir/syn_FAILED.txt"
+
+par:
+  interruptible: false
+  stage: par
+  needs: ["synthesis"]
+  resource_group: ${CONCURRENCY_GROUP}
+  rules:
+    - if: '"$[[ inputs.RUN_PD ]]" == "true"'
+  script:
+    - *script_helpers
+    - WORKSPACE=$(pwd)
+    - echo "STEP workspace=${WORKSPACE}"
+    - export chipyard=/tools/C/$USER/CI_CD_${CI_PIPELINE_ID}
+    - export BUILD_ROOT=${chipyard}/vlsi/build
+    - cd $chipyard
+    - source ~/miniforge3/bin/activate
+    - source ./env.sh
+    - source /tools/C/ee194-sp26/bwrc-env.sh
+    - TODAY=$(date +"%Y-%m-%d")
+    - LAST_SUCCESSFUL_PAR="/tools/C/$USER/pd-archives/last_successful_par.txt"
+    - CONFIG_DIR="chipyard.harness.TestHarness.$[[ inputs.Config ]]-ChipTop"
+    - PAR_RUNDIR="${BUILD_ROOT}/${CONFIG_DIR}/par-rundir"
+    - echo "STEP PAR_RUNDIR=${PAR_RUNDIR}"
+    - |
+      LAST_COMMIT=$(awk '{print $1}' ${LAST_SUCCESSFUL_PAR} 2>/dev/null || echo "none")
+      if [ "$LAST_COMMIT" == "$CI_COMMIT_SHA" ]; then
+        echo "No new commits since last successful nightly (${CI_COMMIT_SHA}). Nothing to do."
+      else
+        echo "Starting PAR — Config:$[[ inputs.Config ]] Branch:${CI_COMMIT_BRANCH} Commit:${CI_COMMIT_SHA}"
+        cd ${chipyard}/vlsi
+        SECONDS=0
+        mkdir -p ${WORKSPACE}/par-rundir
+        make CONFIG=$[[ inputs.Config ]] par 2>&1 | tee ${WORKSPACE}/par-rundir/make_par.log
+        test ${PIPESTATUS[0]} -eq 0
+        echo $SECONDS > ${WORKSPACE}/par-rundir/par_runtime.txt
+        echo "PAR complete. Runtime:${SECONDS}s"
+
+        # Copy final DB + generated-scripts + timingReports + logs to workspace
+        echo "STEP copying PAR outputs to workspace..."
+        mkdir -p ${WORKSPACE}/par-rundir/timingReports
+        mkdir -p ${WORKSPACE}/par-rundir/generated-scripts
+        cp -rL ${PAR_RUNDIR}/ChipTop_FINAL ${WORKSPACE}/par-rundir/ || true
+        cp -r ${PAR_RUNDIR}/timingReports/. ${WORKSPACE}/par-rundir/timingReports/ || true
+        cp -r ${PAR_RUNDIR}/generated-scripts/. ${WORKSPACE}/par-rundir/generated-scripts/ || true
+        cp ${PAR_RUNDIR}/innovus.log ${WORKSPACE}/par-rundir/ || true
+        cp ${PAR_RUNDIR}/par-output.json ${WORKSPACE}/par-rundir/ || true
+        cp ${PAR_RUNDIR}/par-output-full.json ${WORKSPACE}/par-rundir/ || true
+        cp ${PAR_RUNDIR}/mmmc.tcl ${WORKSPACE}/par-rundir/ || true
+        cp ${PAR_RUNDIR}/floorplan.tcl ${WORKSPACE}/par-rundir/ || true
+        cp ${PAR_RUNDIR}/par.tcl ${WORKSPACE}/par-rundir/ || true
+        echo "STEP all PAR copies done"
+
+        # Rewrite open_chip to be portable for any BWRC user
+        printf '#!/bin/bash\n' > ${WORKSPACE}/par-rundir/generated-scripts/open_chip
+        printf 'cd "$(dirname "$0")/.."\n' >> ${WORKSPACE}/par-rundir/generated-scripts/open_chip
+        printf 'export CADENCE_HOME="/tools/cadence"\n' >> ${WORKSPACE}/par-rundir/generated-scripts/open_chip
+        # Redacted: the license server addresses are replaced with <license-server>.
+        printf 'export CDS_LIC_FILE="<license-server>"\n' >> ${WORKSPACE}/par-rundir/generated-scripts/open_chip
+        printf 'export INNOVUS_BIN="/tools/cadence/DDI/DDI231_ISR4/bin/innovus"\n' >> ${WORKSPACE}/par-rundir/generated-scripts/open_chip
+        printf '$INNOVUS_BIN -common_ui -win -files "$(dirname "$0")/open_chip.tcl"\n' >> ${WORKSPACE}/par-rundir/generated-scripts/open_chip
+        chmod +x ${WORKSPACE}/par-rundir/generated-scripts/open_chip
+        echo "STEP open_chip patched"
+        # Patch open_chip.tcl to use ChipTop_FINAL instead of latest symlink
+        sed -i 's|read_db latest|read_db ChipTop_FINAL|g' \
+            ${WORKSPACE}/par-rundir/generated-scripts/open_chip.tcl
+        echo "STEP open_chip.tcl patched"
+
+        # Record last successful PAR commit
+        mkdir -p /tools/C/$USER/pd-archives
+        echo "${CI_COMMIT_SHA} | branch:${CI_COMMIT_BRANCH} | date:${TODAY} | config:$[[ inputs.Config ]]" > ${LAST_SUCCESSFUL_PAR}
+        echo "Last successful PAR recorded."
+      fi
+
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" == "failed" ]; then
+        WORKSPACE=$(pwd)
+        LAST_SUCCESSFUL_PAR="/tools/C/$USER/pd-archives/last_successful_par.txt"
+        BUILD_ROOT=/tools/C/$USER/CI_CD_${CI_PIPELINE_ID}/vlsi/build
+        CONFIG_DIR="chipyard.harness.TestHarness.$[[ inputs.Config ]]-ChipTop"
+        PAR_RUNDIR="${BUILD_ROOT}/${CONFIG_DIR}/par-rundir"
+        mkdir -p ${WORKSPACE}/par-rundir/timingReports
+        cp -r ${PAR_RUNDIR}/timingReports/. ${WORKSPACE}/par-rundir/timingReports/ 2>/dev/null || true
+        cp ${PAR_RUNDIR}/innovus.log ${WORKSPACE}/par-rundir/ 2>/dev/null || true
+        echo "PAR FAILED — Config:$[[ inputs.Config ]] Branch:${CI_COMMIT_BRANCH} Commit:${CI_COMMIT_SHA}" > ${WORKSPACE}/par-rundir/par_FAILED.txt
+        echo "Job URL: ${CI_JOB_URL}" >> ${WORKSPACE}/par-rundir/par_FAILED.txt
+        if [ -f "${LAST_SUCCESSFUL_PAR}" ]; then
+          echo "Last successful PAR was:" >> ${WORKSPACE}/par-rundir/par_FAILED.txt
+          cat ${LAST_SUCCESSFUL_PAR} >> ${WORKSPACE}/par-rundir/par_FAILED.txt
+        else
+          echo "No previous successful PAR on record." >> ${WORKSPACE}/par-rundir/par_FAILED.txt
+        fi
+      fi
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - "par-rundir/"
+
+
+drc:
+  interruptible: false
+  stage: drc
+  needs: ["par"]
+  resource_group: ${CONCURRENCY_GROUP}
+  allow_failure: true
+  rules:
+    - if: '"$[[ inputs.RUN_PD ]]" == "true"'
+  script:
+    - WORKSPACE=$(pwd)
+    - export chipyard=/tools/C/$USER/CI_CD_${CI_PIPELINE_ID}
+    - export BUILD_ROOT=${chipyard}/vlsi/build
+    - cd $chipyard
+    - source ~/miniforge3/bin/activate
+    - source ./env.sh
+    - source /tools/C/ee194-sp26/bwrc-env.sh
+    - CONFIG_DIR="chipyard.harness.TestHarness.$[[ inputs.Config ]]-ChipTop"
+    - DRC_RUNDIR="${BUILD_ROOT}/${CONFIG_DIR}/drc-rundir"
+    - |
+      # Install hammer-mentor-plugins
+      pip install -e ${chipyard}/vlsi/hammer-mentor-plugins
+      # Set up Calibre environment
+      export CALIBRE_SKIP_OS_CHECKS=1
+      export USE_CALIBRE_VCO=aoi
+      # Redacted: the license server addresses are replaced with <license-server>.
+      export MGLS_LICENSE_FILE="<license-server>"
+      echo "Starting DRC — Config:$[[ inputs.Config ]] Commit:${CI_COMMIT_SHA}"
+      cd ${chipyard}/vlsi
+      make CONFIG=$[[ inputs.Config ]] redo-par-to-drc
+      make CONFIG=$[[ inputs.Config ]] redo-drc 2>&1 | tee ${WORKSPACE}/drc_run.log
+      test ${PIPESTATUS[0]} -eq 0
+      # Copy DRC results to workspace
+      mkdir -p ${WORKSPACE}/drc-rundir
+      cp -r ${DRC_RUNDIR}/. ${WORKSPACE}/drc-rundir/ || true
+      echo "DRC complete."
+
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" == "failed" ]; then
+        WORKSPACE=$(pwd)
+        BUILD_ROOT=/tools/C/$USER/CI_CD_${CI_PIPELINE_ID}/vlsi/build
+        CONFIG_DIR="chipyard.harness.TestHarness.$[[ inputs.Config ]]-ChipTop"
+        DRC_RUNDIR="${BUILD_ROOT}/${CONFIG_DIR}/drc-rundir"
+        mkdir -p ${WORKSPACE}/drc-rundir
+        cp -r ${DRC_RUNDIR}/. ${WORKSPACE}/drc-rundir/ 2>/dev/null || true
+        echo "DRC FAILED — Config:$[[ inputs.Config ]] Commit:${CI_COMMIT_SHA}" > ${WORKSPACE}/drc-rundir/drc_FAILED.txt
+        echo "Job URL: ${CI_JOB_URL}" >> ${WORKSPACE}/drc-rundir/drc_FAILED.txt
+      fi
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - "drc-rundir/"
+      - "drc_run.log"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ------------------------------------------------------------------
+#                 METRICS & VISUALS
+# ------------------------------------------------------------------
+generate_metrics_dashboard:
+  interruptible: false
+  stage: metrics
+  needs:
+    - job: test_execution
+      artifacts: true
+      optional: false
+    - job: synthesis
+      artifacts: true
+      optional: true
+    - job: par
+      artifacts: true
+      optional: true
+    - job: drc
+      artifacts: true
+      optional: true
+  when: always
+  script:
+    - *script_helpers
+    - WORKSPACE=$(pwd)
+    - export chipyard=/tools/C/$USER/CI_CD_${CI_PIPELINE_ID}
+    - export QOR_PATH="${WORKSPACE}/syn-rundir/reports/final_qor.rpt"
+    - export SYN_RUNTIME=$(cat ${WORKSPACE}/syn-rundir/syn_runtime.txt 2>/dev/null || echo "")
+    - export PAR_RUNTIME=$(cat ${WORKSPACE}/par-rundir/par_runtime.txt 2>/dev/null || echo "")
+    - export DRC_RPT_PATH="${WORKSPACE}/drc-rundir/drc_results.rpt"
+    - source ~/miniforge3/bin/activate
+    - start_section "GenerateMetrics" "GENERATING IN-DEPTH METRICS HTML..."
+    - |
+      cat << 'EOF' > generate_dashboard.py
+      import xml.etree.ElementTree as ET
+      import json
+      import os
+      import glob
+      import re
+      from datetime import datetime
+      from collections import defaultdict
+
+      # ==========================================
+      # 0. HELPER FUNCTIONS & METADATA
+      # ==========================================
+      def format_duration(seconds):
+          if seconds is None or seconds == "": return "N/A"
+          try:
+              m, s = divmod(int(float(seconds)), 60)
+              h, m = divmod(m, 60)
+              if h > 0: return f"{h}h {m}m {s}s"
+              elif m > 0: return f"{m}m {s}s"
+              return f"{s}s"
+          except:
+              return "N/A"
+
+      branch = os.environ.get('CI_COMMIT_BRANCH', os.environ.get('CI_MERGE_REQUEST_SOURCE_BRANCH_NAME', 'Unknown Branch'))
+      commit = os.environ.get('CI_COMMIT_SHORT_SHA', 'Unknown Commit')
+      pipeline_date = os.environ.get('CI_PIPELINE_CREATED_AT', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+      pipeline_url = os.environ.get('CI_PIPELINE_URL', '#')
+      random_seed = "Unknown"
+      test_suite_path = "$[[ inputs.TestSuitePath ]]"
+      suite_info = {}
+      for log_file in glob.glob('log_*.txt'):
+          with open(log_file, 'r') as f:
+              current_suite = None
+              for line in f:
+                  if line.startswith('RANDOM_SEED:'):
+                      random_seed = line.strip().split(':')[1]
+                  elif line.startswith('TestSuite:'):
+                      current_suite = line.strip().split(':')[1]
+                      if current_suite not in suite_info:
+                          suite_info[current_suite] = {'hw_config': 'Unknown', 'test_type': 'Unknown', 'sim_dir': 'sims/vcs', 'test_dir': 'tests'}
+                          conf_path = os.path.join(test_suite_path, current_suite)
+                          if os.path.exists(conf_path):
+                              with open(conf_path, 'r') as cf:
+                                  for c_line in cf:
+                                      if c_line.startswith('SIM_DIR='):
+                                          suite_info[current_suite]['sim_dir'] = c_line.strip().split('=', 1)[1].strip('"\'')
+                                      if c_line.startswith('TEST_DIR='):
+                                          suite_info[current_suite]['test_dir'] = c_line.strip().split('=', 1)[1].strip('"\'')
+                  elif line.startswith('Hardware Config:') and current_suite:
+                      suite_info[current_suite]['hw_config'] = line.strip().split(':')[1]
+                  elif line.startswith('TEST_TYPE:') and current_suite:
+                      suite_info[current_suite]['test_type'] = line.strip().split(':')[1]
+
+      # ==========================================
+      # 1. PARSE JUNIT XML (TEST RESULTS)
+      # ==========================================
+      xml_file = 'junit_report.xml'
+      total_tests, passed_tests, failed_tests, errored_tests = 0, 0, 0, 0
+      tests_data, suite_summaries = [], {}
+      hw_config_stats = {}
+      global_start_ts, global_end_ts = float('inf'), 0.0
+
+      if os.path.exists(xml_file):
+          try:
+              tree = ET.parse(xml_file)
+              root = tree.getroot()
+              for testcase in root.findall('.//testcase'):
+                  total_tests += 1
+                  name = testcase.get('name', 'Unknown')
+                  suite = testcase.get('classname', 'Unknown')
+                  try:
+                      time_val = float(testcase.get('time', 0))
+                  except (ValueError, TypeError):
+                      time_val = 0.0
+                  start_ts, end_ts = 0.0, 0.0
+                  props = testcase.find('properties')
+                  if props is not None:
+                      for prop in props.findall('property'):
+                          if prop.get('name') == 'start_ts':
+                              start_ts = float(prop.get('value', 0))
+                          elif prop.get('name') == 'end_ts':
+                              end_ts = float(prop.get('value', 0))
+                  if start_ts and end_ts:
+                      global_start_ts = min(global_start_ts, start_ts)
+                      global_end_ts = max(global_end_ts, end_ts)
+                  failure = testcase.find('failure')
+                  error = testcase.find('error')
+                  if failure is not None:
+                      status, msg = 'Failed', failure.get('message', failure.text or '')
+                      failed_tests += 1
+                      status_sort = 1
+                  elif error is not None:
+                      status, msg = 'Error', error.get('message', error.text or '')
+                      errored_tests += 1
+                      status_sort = 2
+                  else:
+                      status, msg = 'Passed', ''
+                      passed_tests += 1
+                      status_sort = 3
+                  
+                  hw_config = suite_info.get(suite, {}).get('hw_config', 'Unknown')
+                  test_type = suite_info.get(suite, {}).get('test_type', 'Unknown')
+                  sim_dir = suite_info.get(suite, {}).get('sim_dir', 'sims/vcs')
+                  test_dir = suite_info.get(suite, {}).get('test_dir', 'tests')
+                  
+                  if hw_config not in hw_config_stats:
+                      hw_config_stats[hw_config] = {'Passed': 0, 'Failed': 0, 'Error': 0}
+                  hw_config_stats[hw_config][status] += 1
+                  
+                  if test_type == 'chisel':
+                      log_link = f"run_logs/run_{suite}_combined.log"
+                      rerun_cmd = f"cd {sim_dir}\n./mill --no-server --disable-ticker -k -j16 atlas.test.testOnly {hw_config}.{name}"
+                  else:
+                      log_link = f"run_logs/run_{suite}_{name}.log"
+                      rerun_cmd = f"cd {test_dir}\nmake\ncd ../../../{sim_dir}\nmake -j16 CONFIG={hw_config} GEN_COVERAGE=1 LOADMEM=1 BINARY=base_schema debug\nmake -j1 GEN_COVERAGE=1 LOADMEM=1 CONFIG={hw_config} BINARY=../../{test_dir}/{name}.riscv run-binary-debug SIM_FLAGS='-no-save -debug_access+all -u'"
+                  
+                  tests_data.append({
+                      'name': name, 'suite': suite, 'time': time_val,
+                      'status': status, 'status_sort': status_sort, 'message': msg.strip(),
+                      'hw_config': hw_config, 'test_type': test_type, 'log_link': log_link,
+                      'rerun_cmd': rerun_cmd
+                  })
+                  
+                  if suite not in suite_summaries:
+                      suite_summaries[suite] = {'total': 0, 'passed': 0, 'failed': 0, 'hw_config': hw_config, 'test_type': test_type, 'start_ts': float('inf'), 'end_ts': 0.0}
+                  suite_summaries[suite]['total'] += 1
+                  
+                  if start_ts and end_ts:
+                      suite_summaries[suite]['start_ts'] = min(suite_summaries[suite]['start_ts'], start_ts)
+                      suite_summaries[suite]['end_ts'] = max(suite_summaries[suite]['end_ts'], end_ts)
+                  
+                  if status == 'Passed':
+                      suite_summaries[suite]['passed'] += 1
+                  else:
+                      suite_summaries[suite]['failed'] += 1
+          except Exception as e:
+              print(f"Warning: Failed to parse {xml_file} - {e}")
+
+      total_duration = global_end_ts - global_start_ts if global_end_ts > global_start_ts else 0.0
+      suite_durations = {}
+      for s, data in suite_summaries.items():
+          if data['start_ts'] != float('inf') and data['end_ts'] != 0.0:
+              data['duration'] = data['end_ts'] - data['start_ts']
+          else:
+              data['duration'] = 0.0
+          suite_durations[s] = data['duration']
+
+      # ==========================================
+      # 2. PARSE HARDWARE COVERAGE (tests.txt)
+      # ==========================================
+      coverage_data = []
+      cov_files = glob.glob("run_logs/cov_overall_*/tests.txt") + glob.glob("run_logs/cov_overall_*/dashboard.txt")
+      for cov_file in cov_files:
+          try:
+              hw_config = cov_file.split('cov_overall_')[1].split('/')[0]
+              with open(cov_file, 'r') as f:
+                  lines = f.readlines()
+                  headers, values = [], []
+                  for i, line in enumerate(lines):
+                      if "Total Coverage Summary" in line:
+                          if i + 2 < len(lines):
+                              headers = lines[i+1].strip().split()
+                              values = lines[i+2].strip().split()
+                          break
+                  if headers and values and hw_config not in [c['config'] for c in coverage_data]:
+                      coverage_data.append({'config': hw_config, 'headers': headers, 'values': values})
+          except Exception as e:
+              print(f"Warning: Failed to parse coverage file {cov_file} - {e}")
+
+      cov_html = ""
+      if coverage_data:
+          cov_html += """
+          <div class="card dark:bg-[#1f2937] dark:border-gray-700 mb-8 border-l-4 border-indigo-500">
+              <h2 class="text-xl font-bold text-gray-700 dark:text-gray-200 mb-4">Hardware Coverage Summary (URG)</h2>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          """
+          for cov in coverage_data:
+              cov_html += f"""
+                  <div class="p-4 border dark:border-gray-600 rounded shadow-sm bg-gray-50 dark:bg-gray-800">
+                      <strong class="text-indigo-700 dark:text-indigo-400">{cov['config']}</strong>
+                      <div class="overflow-x-auto mt-2">
+                          <table class="w-full text-sm text-left text-gray-600 dark:text-gray-300">
+                              <thead class="text-xs text-gray-700 dark:text-gray-400 uppercase bg-gray-200 dark:bg-gray-700">
+                                  <tr>
+              """
+              for h in cov['headers']: cov_html += f"<th class='px-3 py-2'>{h}</th>"
+              cov_html += "</tr></thead><tbody><tr class='bg-white dark:bg-gray-900 border-b dark:border-gray-700'>"
+              for v in cov['values']:
+                  color_class = "text-green-600 font-bold" if float(v.replace('%','')) > 80.0 else "text-red-500 font-bold" if v != "0.00" else ""
+                  cov_html += f"<td class='px-3 py-2 font-mono {color_class}'>{v}%</td>"
+              cov_html += "</tr></tbody></table></div></div>"
+          cov_html += "</div></div>"
+
+      # ==========================================
+      # 3. PARSE PD METRICS & HISTORY NATIVELY
+      # ==========================================
+      pd_html = ""
+      js_pd_charts = ""
+      pd_labels_js = "[]"
+      pd_metrics = {
+          "cell_area": None, "total_cell_area": None, "net_area": None,
+          "leaf_instances": None, "sequential_instances": None, "combinational_instances": None,
+          "wns_per_clock": {}, "tns_total": None, "failing_paths": None,
+      }
+
+      qor_path = os.environ.get('QOR_PATH', '')
+      
+      # Process PD Stats directly
+      if os.path.exists(qor_path):
+          with open(qor_path, 'r') as f:
+              content = f.read()
+              lines = content.splitlines()
+
+          # --- Area and Instances Regex Extractions ---
+          m = re.search(r"Cell Area\s+([\d,\.]+)", content)
+          if m: pd_metrics["cell_area"] = float(m.group(1).replace(",", ""))
+
+          m = re.search(r"Leaf Instance Count\s+([\d,]+)", content)
+          if m: pd_metrics["leaf_instances"] = int(m.group(1).replace(",", ""))
+
+          # --- Timing Table Parsing (TNS, WNS, Failing Paths) ---
+          in_timing_table = False
+          tns_total = 0.0
+          failing_total = 0
+
+          for line in lines:
+              if re.search(r"Analysis\s+.*Cost\s+.*Critical", line):
+                  in_timing_table = True
+                  continue
+              if in_timing_table:
+                  if re.match(r"^-{10,}", line): continue
+                  if re.match(r"^\s*Total\s", line):
+                      in_timing_table = False
+                      continue
+                  if not line.strip(): continue
+
+                  # Match <clock_name> <slack> <tns> <failing_count>
+                  m = re.search(r"(\S+)\s+([\d\.\-]+)\s+([\d\.\-]+)\s+(\d+)\s*$", line)
+                  if m:
+                      clock_name = m.group(1)
+                      slack = float(m.group(2))
+                      tns = float(m.group(3))
+                      failing = int(m.group(4))
+
+                      if not clock_name.startswith("cg_enable") and clock_name != "default":
+                          if clock_name not in pd_metrics["wns_per_clock"]:
+                              pd_metrics["wns_per_clock"][clock_name] = slack
+                          else:
+                              pd_metrics["wns_per_clock"][clock_name] = min(pd_metrics["wns_per_clock"][clock_name], slack)
+
+                      tns_total += tns
+                      failing_total += failing
+
+          pd_metrics["tns_total"] = round(tns_total, 3)
+          pd_metrics["failing_paths"] = failing_total
+
+          # --- Save to History ---
+          history_path = f"/tools/C/{os.environ.get('USER', 'default')}/pd-archives/metrics_history.json"
+          
+          syn_runtime_str = os.environ.get('SYN_RUNTIME', '')
+          par_runtime_str = os.environ.get('PAR_RUNTIME', '')
+          try: syn_runtime_sec = float(syn_runtime_str) if syn_runtime_str.strip() else None
+          except: syn_runtime_sec = None
+          try: par_runtime_sec = float(par_runtime_str) if par_runtime_str.strip() else None
+          except: par_runtime_sec = None
+
+          entry = {
+              "date": pipeline_date.split(" ")[0],
+              "commit": commit,
+              "branch": branch,
+              "config": "$[[ inputs.Config ]]",
+              "syn_runtime_seconds": syn_runtime_sec,
+              "par_runtime_seconds": par_runtime_sec,
+              **pd_metrics
+          }
+          
+          hist_data = []
+          if os.path.exists(history_path):
+              try:
+                  with open(history_path, 'r') as hf:
+                      hist_data = json.load(hf)
+              except: pass
+                  
+          replaced = False
+          for i, existing in enumerate(hist_data):
+              if existing.get("commit") == entry["commit"] and existing.get("config") == entry["config"]:
+                  hist_data[i] = entry
+                  replaced = True
+                  break
+          if not replaced: hist_data.append(entry)
+              
+          try:
+              os.makedirs(os.path.dirname(history_path), exist_ok=True)
+              with open(history_path, 'w') as hf: json.dump(hist_data, hf, indent=2)
+          except Exception as e:
+              print(f"Notice: Could not append pd-archive history: {e}")
+
+          # --- Safe Casting Helpers ---
+          def safe_minutes(val):
+              if val is None or val == "": return None
+              try: return round(float(val) / 60, 1)
+              except: return None
+              
+          def fmt_area(v):
+              if v is None or v == "": return "N/A"
+              try: return f"{float(v):,.0f}"
+              except: return "N/A"
+              
+          def fmt_runtime(v):
+              if v is None or v == "": return "N/A"
+              try: return f"{round(float(v) / 60, 1)}"
+              except: return "N/A"
+
+          # --- Formatting PD UI Component ---
+          entries = sorted([e for e in hist_data if e.get("cell_area") is not None], key=lambda e: e.get("date", ""))
+          all_clocks = sorted({c for e in entries for c in e.get("wns_per_clock", {})})
+          pd_labels_js = json.dumps([f"{e.get('commit', 'Unknown')[:8]}\\n{e.get('date', '')}" for e in entries])
+          
+          area_js = json.dumps([e.get("cell_area") for e in entries])
+          tns_js = json.dumps([e.get("tns_total") for e in entries])
+          failing_js = json.dumps([e.get("failing_paths") for e in entries])
+          syn_runtime_js = json.dumps([safe_minutes(e.get("syn_runtime_seconds")) for e in entries])
+          par_runtime_js = json.dumps([safe_minutes(e.get("par_runtime_seconds")) for e in entries])
+          
+          clock_colors = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1", "#ff9da7"]
+          wns_datasets_js = json.dumps([
+              {
+                  "label": clock,
+                  "data": [e.get("wns_per_clock", {}).get(clock) for e in entries],
+                  "borderColor": clock_colors[i % len(clock_colors)],
+                  "backgroundColor": clock_colors[i % len(clock_colors)],
+                  "tension": 0.3, "fill": False,
+              }
+              for i, clock in enumerate(all_clocks)
+          ])
+          
+          tns_val = entry.get("tns_total")
+          tns_class = "text-green-500" if tns_val is not None and tns_val >= 0 else "text-red-500"
+          
+          fail_val = entry.get("failing_paths")
+          fail_class = "text-green-500" if fail_val == 0 else "text-red-500"
+          
+          syn_run = fmt_runtime(entry.get('syn_runtime_seconds'))
+          par_run = fmt_runtime(entry.get('par_runtime_seconds'))
+
+          wns_rows = "".join(
+              f"<tr class='border-b dark:border-gray-700 bg-white dark:bg-[#1f2937]'>"
+              f"<td class='px-4 py-2 font-medium text-gray-800 dark:text-gray-200'>{clock}</td>"
+              f"<td class='px-4 py-2 font-mono text-gray-700 dark:text-gray-300'>{slack:,.1f} ps</td>"
+              f"<td class='px-4 py-2'>{'✅' if slack >= 0 else '❌'}</td></tr>"
+              for clock, slack in entry.get("wns_per_clock", {}).items()
+          )
+
+          pd_html = f"""
+          <div class="mt-16 pt-8 border-t dark:border-gray-800">
+              <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-100 mb-6">Physical Design (PD) Metrics <span class="text-lg font-normal text-gray-500">(Config: $[[ inputs.Config ]])</span></h2>
+              
+              <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-6 mb-8">
+                  <div class="card dark:bg-[#1f2937] dark:border-gray-700 border border-gray-100">
+                      <h3 class="text-gray-500 dark:text-gray-400 text-xs font-semibold uppercase">Cell Area</h3>
+                      <p class="text-xl font-bold text-gray-800 dark:text-gray-200 mt-2">{fmt_area(entry.get('cell_area'))} <span class="text-xs text-gray-500">µm²</span></p>
+                  </div>
+                  <div class="card dark:bg-[#1f2937] dark:border-gray-700 border border-gray-100">
+                      <h3 class="text-gray-500 dark:text-gray-400 text-xs font-semibold uppercase">TNS</h3>
+                      <p class="text-xl font-bold {tns_class} mt-2">{entry.get('tns_total', 'N/A')} <span class="text-xs text-gray-500">ps</span></p>
+                  </div>
+                  <div class="card dark:bg-[#1f2937] dark:border-gray-700 border border-gray-100">
+                      <h3 class="text-gray-500 dark:text-gray-400 text-xs font-semibold uppercase">Failing Paths</h3>
+                      <p class="text-xl font-bold {fail_class} mt-2">{entry.get('failing_paths', 'N/A')}</p>
+                  </div>
+                  <div class="card dark:bg-[#1f2937] dark:border-gray-700 border border-gray-100">
+                      <h3 class="text-gray-500 dark:text-gray-400 text-xs font-semibold uppercase">Leaf Instances</h3>
+                      <p class="text-xl font-bold text-gray-800 dark:text-gray-200 mt-2">{f"{entry.get('leaf_instances'):,}" if entry.get('leaf_instances') is not None else "N/A"}</p>
+                  </div>
+                  <div class="card dark:bg-[#1f2937] dark:border-gray-700 border border-gray-100">
+                      <h3 class="text-gray-500 dark:text-gray-400 text-xs font-semibold uppercase">Syn Runtime</h3>
+                      <p class="text-xl font-bold text-gray-800 dark:text-gray-200 mt-2">{syn_run} <span class="text-xs text-gray-500">min</span></p>
+                  </div>
+                  <div class="card dark:bg-[#1f2937] dark:border-gray-700 border border-gray-100">
+                      <h3 class="text-gray-500 dark:text-gray-400 text-xs font-semibold uppercase">PAR Runtime</h3>
+                      <p class="text-xl font-bold text-gray-800 dark:text-gray-200 mt-2">{par_run} <span class="text-xs text-gray-500">min</span></p>
+                  </div>
+              </div>
+              
+              <div class="card dark:bg-[#1f2937] mb-8">
+                  <h2 class="text-xl font-bold text-gray-700 dark:text-gray-200 mb-4">WNS Per Clock Domain (Latest Run)</h2>
+                  <div class="overflow-x-auto">
+                      <table class="w-full text-sm text-left text-gray-600 dark:text-gray-300">
+                          <thead class="text-xs text-gray-700 dark:text-gray-400 uppercase bg-gray-100 dark:bg-gray-700">
+                              <tr><th class="px-4 py-2">Clock</th><th class="px-4 py-2">WNS</th><th class="px-4 py-2">Status</th></tr>
+                          </thead>
+                          <tbody>{wns_rows}</tbody>
+                      </table>
+                  </div>
+              </div>
+
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
+                  <div class="card dark:bg-[#1f2937]">
+                      <h2 class="text-lg font-bold text-gray-700 dark:text-gray-300 mb-4">Cell Area Over Time (µm²)</h2>
+                      <div class="relative w-full h-64"><canvas id="pdAreaChart"></canvas></div>
+                  </div>
+                  <div class="card dark:bg-[#1f2937]">
+                      <h2 class="text-lg font-bold text-gray-700 dark:text-gray-300 mb-4">WNS Per Clock Domain Over Time (ps)</h2>
+                      <div class="relative w-full h-64"><canvas id="pdWnsChart"></canvas></div>
+                  </div>
+                  <div class="card dark:bg-[#1f2937]">
+                      <h2 class="text-lg font-bold text-gray-700 dark:text-gray-300 mb-4">TNS Over Time (ps)</h2>
+                      <div class="relative w-full h-64"><canvas id="pdTnsChart"></canvas></div>
+                  </div>
+                  <div class="card dark:bg-[#1f2937]">
+                      <h2 class="text-lg font-bold text-gray-700 dark:text-gray-300 mb-4">Runtime Over Time (minutes)</h2>
+                      <div class="relative w-full h-64"><canvas id="pdRuntimeChart"></canvas></div>
+                  </div>
+              </div>
+          </div>
+          """
+          
+          js_pd_charts = f"""
+          const pdLabels = {pd_labels_js};
+          const pdChartOpts = {{
+              responsive: true, maintainAspectRatio: false,
+              plugins: {{ legend: {{ labels: {{ color: document.documentElement.classList.contains('dark') ? '#d1d5db' : '#374151' }} }} }},
+              scales: {{
+                  x: {{ ticks: {{ color: document.documentElement.classList.contains('dark') ? '#9ca3af' : '#6b7280', maxRotation: 45 }}, grid: {{ color: document.documentElement.classList.contains('dark') ? '#374151' : '#e5e7eb' }} }},
+                  y: {{ ticks: {{ color: document.documentElement.classList.contains('dark') ? '#9ca3af' : '#6b7280' }}, grid: {{ color: document.documentElement.classList.contains('dark') ? '#374151' : '#e5e7eb' }} }}
+              }}
+          }};
+          
+          new Chart(document.getElementById('pdAreaChart'), {{
+              type: 'line', data: {{ labels: pdLabels, datasets: [{{ label: 'Cell Area (µm²)', data: {area_js}, borderColor: '#4e79a7', backgroundColor: 'rgba(78,121,167,0.1)', tension: 0.3, fill: true }}] }},
+              options: pdChartOpts
+          }});
+          new Chart(document.getElementById('pdWnsChart'), {{
+              type: 'line', data: {{ labels: pdLabels, datasets: {wns_datasets_js} }}, options: pdChartOpts
+          }});
+          new Chart(document.getElementById('pdTnsChart'), {{
+              type: 'line', data: {{ labels: pdLabels, datasets: [{{ label: 'TNS (ps)', data: {tns_js}, borderColor: '#e15759', backgroundColor: 'rgba(225,87,89,0.1)', tension: 0.3, fill: true }}] }},
+              options: pdChartOpts
+          }});
+          new Chart(document.getElementById('pdRuntimeChart'), {{
+              type: 'line', data: {{ labels: pdLabels, datasets: [
+                  {{ label: 'Syn (min)', data: {syn_runtime_js}, borderColor: '#59a14f', tension: 0.3, fill: false }},
+                  {{ label: 'PAR (min)', data: {par_runtime_js}, borderColor: '#f28e2b', tension: 0.3, fill: false }}
+              ]}}, options: pdChartOpts
+          }});
+          """
+
+      # ==========================================
+      # 3.5 PARSE DRC METRICS & HISTORY
+      # ==========================================
+      drc_html = ""
+      js_drc_charts = ""
+
+      drc_rpt_path = os.environ.get('DRC_RPT_PATH', '')
+
+      def parse_drc_rpt(path):
+          """Parse drc_results.rpt and return metrics dict."""
+          rules = {}
+          total_errors = None
+          total_executed = None
+          in_global = False
+
+          with open(path, 'r') as f:
+              for line in f:
+                  # Enter the global (non-per-cell) RULECHECK RESULTS STATISTICS block
+                  if '--- RULECHECK RESULTS STATISTICS' in line and 'BY CELL' not in line:
+                      in_global = True
+                      continue
+                  # Exit when we hit the SUMMARY block
+                  if in_global and line.startswith('--- SUMMARY'):
+                      in_global = False
+                  # Parse non-indented RULECHECK lines (global section only)
+                  if in_global and line.startswith('RULECHECK '):
+                      m = re.match(r'^RULECHECK (\S+)\s+\.+\s+TOTAL Result Count = (\d+)', line)
+                      if m:
+                          rules[m.group(1)] = int(m.group(2))
+                  # Parse summary totals (outside any block)
+                  if 'TOTAL DRC Results Generated:' in line:
+                      m = re.search(r'TOTAL DRC Results Generated:\s+(\d+)', line)
+                      if m: total_errors = int(m.group(1))
+                  if 'TOTAL DRC RuleChecks Executed:' in line:
+                      m = re.search(r'TOTAL DRC RuleChecks Executed:\s+(\d+)', line)
+                      if m: total_executed = int(m.group(1))
+
+          # Category breakdown by rule name prefix (before first dot or colon)
+          categories = defaultdict(int)
+          for rule, count in rules.items():
+              if count == 0:
+                  continue
+              prefix = re.split(r'[.:]', rule)[0]
+              categories[prefix] += count
+
+          violated = {k: v for k, v in rules.items() if v > 0}
+
+          return {
+              "total_errors": total_errors,
+              "total_rules_executed": total_executed,
+              "total_rules_violated": len(violated),
+              "per_rule_counts": rules,
+              "category_counts": dict(categories),
+          }
+
+      if os.path.exists(drc_rpt_path):
+          print(f"Parsing DRC report: {drc_rpt_path}")
+          try:
+              drc_metrics = parse_drc_rpt(drc_rpt_path)
+          except Exception as e:
+              print(f"Warning: Failed to parse DRC report: {e}")
+              drc_metrics = None
+
+          if drc_metrics:
+              # --- Load / update DRC history ---
+              drc_history_path = f"/tools/C/{os.environ.get('USER', 'default')}/pd-archives/drc_history.json"
+              drc_hist = []
+              if os.path.exists(drc_history_path):
+                  try:
+                      with open(drc_history_path, 'r') as f:
+                          drc_hist = json.load(f)
+                  except: pass
+
+              drc_entry = {
+                  "date": pipeline_date.split(" ")[0],
+                  "commit": commit,
+                  "branch": branch,
+                  "config": "$[[ inputs.Config ]]",
+                  "total_errors": drc_metrics["total_errors"],
+                  "total_rules_executed": drc_metrics["total_rules_executed"],
+                  "total_rules_violated": drc_metrics["total_rules_violated"],
+                  "category_counts": drc_metrics["category_counts"],
+                  # Only store violated rules to keep history file reasonable
+                  "per_rule_counts": {k: v for k, v in drc_metrics["per_rule_counts"].items() if v > 0},
+              }
+
+              # Find previous entry for new-error diff
+              prev_entry = None
+              replaced = False
+              for i, existing in enumerate(drc_hist):
+                  if existing.get("commit") == commit and existing.get("config") == "$[[ inputs.Config ]]":
+                      drc_hist[i] = drc_entry
+                      replaced = True
+                  elif existing.get("config") == "$[[ inputs.Config ]]":
+                      prev_entry = existing  # last one seen before current commit
+              if not replaced:
+                  drc_hist.append(drc_entry)
+
+              try:
+                  os.makedirs(os.path.dirname(drc_history_path), exist_ok=True)
+                  with open(drc_history_path, 'w') as f:
+                      json.dump(drc_hist, f, indent=2)
+              except Exception as e:
+                  print(f"Notice: Could not save DRC history: {e}")
+
+              # --- Build per-rule change table vs previous run ---
+              # Every rule where count changed (including new=was 0, resolved=now 0)
+              change_rows = ""
+              if prev_entry:
+                  prev_violated = prev_entry.get("per_rule_counts", {})
+                  cur_violated = drc_entry["per_rule_counts"]
+                  all_rules = set(prev_violated.keys()) | set(cur_violated.keys())
+                  changes = []
+                  for rule in all_rules:
+                      prev_count = prev_violated.get(rule, 0)
+                      cur_count = cur_violated.get(rule, 0)
+                      if prev_count != cur_count:
+                          changes.append((rule, prev_count, cur_count))
+                  # Sort: new first, resolved last, rest by absolute delta descending
+                  def change_sort_key(x):
+                      rule, prev_c, cur_c = x
+                      if prev_c == 0: return (0, -cur_c)
+                      if cur_c == 0: return (2, -prev_c)
+                      return (1, -(abs(cur_c - prev_c)))
+                  changes.sort(key=change_sort_key)
+                  for rule, prev_c, cur_c in changes:
+                      if prev_c == 0:
+                          tag = "<span class='text-xs font-semibold text-red-500 bg-red-50 dark:bg-red-900/30 px-1.5 py-0.5 rounded'>NEW</span>"
+                          row_class = "text-red-700 dark:text-red-300"
+                          delta_str = f"+{cur_c:,}"
+                          delta_class = "text-red-600 dark:text-red-400 font-bold"
+                      elif cur_c == 0:
+                          tag = "<span class='text-xs font-semibold text-green-600 bg-green-50 dark:bg-green-900/30 px-1.5 py-0.5 rounded'>FIXED</span>"
+                          row_class = "text-green-700 dark:text-green-300"
+                          delta_str = f"-{prev_c:,}"
+                          delta_class = "text-green-600 dark:text-green-400 font-bold"
+                      elif cur_c > prev_c:
+                          tag = ""
+                          row_class = ""
+                          delta_str = f"+{cur_c - prev_c:,}"
+                          delta_class = "text-red-600 dark:text-red-400 font-bold"
+                      else:
+                          tag = ""
+                          row_class = ""
+                          delta_str = f"-{prev_c - cur_c:,}"
+                          delta_class = "text-green-600 dark:text-green-400 font-bold"
+                      change_rows += (
+                          f"<tr class='border-b dark:border-gray-700'>"
+                          f"<td class='px-4 py-2 font-mono text-xs {row_class}'>{rule}</td>"
+                          f"<td class='px-4 py-2 text-center'>{tag}</td>"
+                          f"<td class='px-4 py-2 text-right text-gray-500 dark:text-gray-400'>{prev_c:,}</td>"
+                          f"<td class='px-4 py-2 text-right'>{cur_c:,}</td>"
+                          f"<td class='px-4 py-2 text-right {delta_class}'>{delta_str}</td>"
+                          f"</tr>"
+                      )
+                  if not changes:
+                      change_rows = "<tr><td colspan='5' class='px-4 py-3 text-gray-500 dark:text-gray-400 italic text-center'>No rule counts changed since last run.</td></tr>"
+              else:
+                  change_rows = "<tr><td colspan='5' class='px-4 py-3 text-gray-500 dark:text-gray-400 italic text-center'>No previous run to compare against.</td></tr>"
+
+              # --- Build trend data from history ---
+              drc_entries_sorted = sorted(
+                  [e for e in drc_hist if e.get("config") == "$[[ inputs.Config ]]" and e.get("total_errors") is not None],
+                  key=lambda e: e.get("date", "")
+              )
+              drc_labels_js = json.dumps([f"{e['commit'][:8]}\\n{e['date']}" for e in drc_entries_sorted])
+              drc_total_errors_js = json.dumps([e.get("total_errors") for e in drc_entries_sorted])
+              drc_rules_violated_js = json.dumps([e.get("total_rules_violated") for e in drc_entries_sorted])
+
+              # --- Category trend data: all prefixes ever seen, with 0-fill for missing runs ---
+              all_prefixes = sorted({
+                  prefix
+                  for e in drc_entries_sorted
+                  for prefix in e.get("category_counts", {}).keys()
+              })
+              # Build per-prefix series, filling 0 when absent in a run
+              cat_trend_data = {}
+              for prefix in all_prefixes:
+                  cat_trend_data[prefix] = [
+                      e.get("category_counts", {}).get(prefix, 0)
+                      for e in drc_entries_sorted
+                  ]
+              cat_trend_data_js = json.dumps(cat_trend_data)
+              all_prefixes_js = json.dumps(all_prefixes)
+
+              # --- Summary card values ---
+              total_err_fmt = f"{drc_metrics['total_errors']:,}" if drc_metrics['total_errors'] is not None else "N/A"
+              rules_violated_fmt = str(drc_metrics['total_rules_violated'])
+              rules_exec_fmt = f"{drc_metrics['total_rules_executed']:,}" if drc_metrics['total_rules_executed'] is not None else "N/A"
+              prev_label = f"vs commit {prev_entry['commit'][:8]}" if prev_entry else "no previous run"
+              changed_count = len([r for r in change_rows.split('<tr') if 'NEW' in r or 'FIXED' in r or 'font-bold' in r]) if prev_entry else 0
+
+              drc_html = f"""
+              <div class="mt-16 pt-8 border-t dark:border-gray-800">
+                  <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-100 mb-6">DRC Metrics <span class="text-lg font-normal text-gray-500">(Config: $[[ inputs.Config ]])</span></h2>
+
+                  <div class="grid grid-cols-2 md:grid-cols-3 gap-6 mb-8">
+                      <div class="card dark:bg-[#1f2937] dark:border-gray-700 border border-gray-100">
+                          <h3 class="text-gray-500 dark:text-gray-400 text-xs font-semibold uppercase">Total DRC Errors</h3>
+                          <p class="text-xl font-bold text-red-600 dark:text-red-400 mt-2">{total_err_fmt}</p>
+                      </div>
+                      <div class="card dark:bg-[#1f2937] dark:border-gray-700 border border-gray-100">
+                          <h3 class="text-gray-500 dark:text-gray-400 text-xs font-semibold uppercase">Rules Violated</h3>
+                          <p class="text-xl font-bold text-orange-500 dark:text-orange-400 mt-2">{rules_violated_fmt} <span class="text-xs text-gray-500">/ {rules_exec_fmt}</span></p>
+                      </div>
+                      <div class="card dark:bg-[#1f2937] dark:border-gray-700 border border-gray-100">
+                          <h3 class="text-gray-500 dark:text-gray-400 text-xs font-semibold uppercase">Compared To</h3>
+                          <p class="text-xl font-bold text-gray-800 dark:text-gray-200 mt-2">{prev_label}</p>
+                      </div>
+                  </div>
+
+                  <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
+                      <div class="card dark:bg-[#1f2937]">
+                          <h2 class="text-lg font-bold text-gray-700 dark:text-gray-300 mb-4">Total DRC Errors Over Time</h2>
+                          <div class="relative w-full h-64"><canvas id="drcTotalChart"></canvas></div>
+                      </div>
+                      <div class="card dark:bg-[#1f2937]">
+                          <h2 class="text-lg font-bold text-gray-700 dark:text-gray-300 mb-4">Rules Violated Over Time</h2>
+                          <div class="relative w-full h-64"><canvas id="drcRulesChart"></canvas></div>
+                      </div>
+                  </div>
+
+                  <div class="card dark:bg-[#1f2937] mb-8">
+                      <div class="flex items-center gap-4 mb-4">
+                          <h2 class="text-lg font-bold text-gray-700 dark:text-gray-300">Category Errors Over Time</h2>
+                          <select id="drcCatSelect" class="text-sm border border-gray-300 dark:border-gray-600 rounded px-2 py-1 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300">
+                          </select>
+                      </div>
+                      <div class="relative w-full h-64"><canvas id="drcCatChart"></canvas></div>
+                  </div>
+
+                  <div class="card dark:bg-[#1f2937] mb-8">
+                      <h2 class="text-xl font-bold text-gray-700 dark:text-gray-200 mb-1">Rule changes since last run</h2>
+                      <p class="text-sm text-gray-500 dark:text-gray-400 mb-4">{prev_label}</p>
+                      <div class="overflow-x-auto">
+                          <table class="w-full text-sm text-left text-gray-600 dark:text-gray-300" style="table-layout: fixed;">
+                              <colgroup>
+                                  <col style="width: 45%;">
+                                  <col style="width: 10%;">
+                                  <col style="width: 15%;">
+                                  <col style="width: 15%;">
+                                  <col style="width: 15%;">
+                              </colgroup>
+                              <thead class="text-xs text-gray-700 dark:text-gray-400 uppercase bg-gray-100 dark:bg-gray-700 sticky top-0">
+                                  <tr>
+                                      <th class="px-4 py-2">Rule</th>
+                                      <th class="px-4 py-2 text-center">Status</th>
+                                      <th class="px-4 py-2 text-right">Last run</th>
+                                      <th class="px-4 py-2 text-right">This run</th>
+                                      <th class="px-4 py-2 text-right">Delta</th>
+                                  </tr>
+                              </thead>
+                          </table>
+                          <div style="max-height: 400px; overflow-y: auto;">
+                              <table class="w-full text-sm text-left text-gray-600 dark:text-gray-300" style="table-layout: fixed;">
+                                  <colgroup>
+                                      <col style="width: 45%;">
+                                      <col style="width: 10%;">
+                                      <col style="width: 15%;">
+                                      <col style="width: 15%;">
+                                      <col style="width: 15%;">
+                                  </colgroup>
+                                  <tbody>{change_rows}</tbody>
+                              </table>
+                          </div>
+                      </div>
+                  </div>
+              </div>
+              """
+
+              js_drc_charts = f"""
+              const drcChartOpts = {{
+                  responsive: true, maintainAspectRatio: false,
+                  plugins: {{ legend: {{ display: false }} }},
+                  scales: {{
+                      x: {{ ticks: {{ color: document.documentElement.classList.contains('dark') ? '#9ca3af' : '#6b7280', maxRotation: 45 }}, grid: {{ color: document.documentElement.classList.contains('dark') ? '#374151' : '#e5e7eb' }} }},
+                      y: {{ ticks: {{ color: document.documentElement.classList.contains('dark') ? '#9ca3af' : '#6b7280' }}, grid: {{ color: document.documentElement.classList.contains('dark') ? '#374151' : '#e5e7eb' }} }}
+                  }}
+              }};
+              new Chart(document.getElementById('drcTotalChart'), {{
+                  type: 'line',
+                  data: {{ labels: {drc_labels_js}, datasets: [{{ label: 'Total DRC Errors', data: {drc_total_errors_js}, borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,0.1)', tension: 0.3, fill: true }}] }},
+                  options: drcChartOpts
+              }});
+              new Chart(document.getElementById('drcRulesChart'), {{
+                  type: 'line',
+                  data: {{ labels: {drc_labels_js}, datasets: [{{ label: 'Rules Violated', data: {drc_rules_violated_js}, borderColor: '#f97316', backgroundColor: 'rgba(249,115,22,0.1)', tension: 0.3, fill: true }}] }},
+                  options: drcChartOpts
+              }});
+
+              // Category trend chart with dropdown
+              const catTrendData = {cat_trend_data_js};
+              const allPrefixes = {all_prefixes_js};
+              const drcRunLabels = {drc_labels_js};
+
+              const catSelect = document.getElementById('drcCatSelect');
+              allPrefixes.forEach(p => {{
+                  const opt = document.createElement('option');
+                  opt.value = p; opt.textContent = p;
+                  catSelect.appendChild(opt);
+              }});
+
+              const catCtx = document.getElementById('drcCatChart').getContext('2d');
+              const catChart = new Chart(catCtx, {{
+                  type: 'line',
+                  data: {{
+                      labels: drcRunLabels,
+                      datasets: [{{
+                          label: allPrefixes[0] || '',
+                          data: allPrefixes.length ? catTrendData[allPrefixes[0]] : [],
+                          borderColor: '#ef4444',
+                          backgroundColor: 'rgba(239,68,68,0.1)',
+                          tension: 0.3, fill: true
+                      }}]
+                  }},
+                  options: drcChartOpts
+              }});
+
+              catSelect.addEventListener('change', function() {{
+                  const prefix = this.value;
+                  catChart.data.datasets[0].label = prefix;
+                  catChart.data.datasets[0].data = catTrendData[prefix] || [];
+                  catChart.update();
+              }});
+              """
+
+      # ------------------------------------------------------------------
+      # 4. EXTRACT IPC METRICS FROM LOG FILES
+      # ------------------------------------------------------------------
+      ipc_data = []
+      # Recursively search for log files in the workspace
+      for log_file in glob.glob("run_logs/*.log"):
+          try:
+              with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                  content = f.read()
+                  # Match "mcycle = X" or "mcycles = X"
+                  mcycle_match = re.search(r'mcycles?\s*=\s*(\d+)', content)
+                  # Match "minstret = X"
+                  minstret_match = re.search(r'minstret\s*=\s*(\d+)', content)
+
+                  if mcycle_match and minstret_match:
+                      mcycles = int(mcycle_match.group(1))
+                      minstret = int(minstret_match.group(1))
+                      # Prevent divide-by-zero
+                      ipc = minstret / mcycles if mcycles > 0 else 0
+                      
+                      ipc_data.append({
+                          'test': os.path.basename(log_file),
+                          'mcycles': mcycles,
+                          'minstret': minstret,
+                          'ipc': ipc
+                      })
+          except Exception as e:
+              print(f"Warning: Could not parse {log_file} for IPC: {e}")
+
+      # Build IPC Table HTML Rows
+      ipc_rows_html = ""
+      for row in ipc_data:
+          ipc_rows_html += f"<tr><td>{row['test']}</td><td>{row['mcycles']}</td><td>{row['minstret']}</td><td>{row['ipc']:.4f}</td></tr>\n"
+
+      ipc_table_html = f"""
+      <div class="card dark:bg-[#1f2937] border-t-4 border-indigo-500 mb-8 mt-8">
+          <h2 class="text-xl font-bold text-gray-700 dark:text-gray-200 mb-4">Simulation IPC Metrics</h2>
+          <div class="overflow-x-auto">
+              <table id="ipcTable" class="display w-full text-sm text-left text-gray-500 dark:text-gray-300">
+                  <thead class="text-xs text-gray-700 dark:text-gray-300 uppercase bg-gray-50 dark:bg-gray-700 border-b dark:border-gray-600">
+                      <tr>
+                          <th class="px-4 py-2">Test Name (Log File)</th>
+                          <th class="px-4 py-2">mcycles</th>
+                          <th class="px-4 py-2">minstret</th>
+                          <th class="px-4 py-2">Calculated IPC</th>
+                      </tr>
+                  </thead>
+                  <tbody>
+                      {ipc_rows_html}
+                  </tbody>
+              </table>
+          </div>
+      </div>
+      """
+
+      # ==========================================
+      # 5. GENERATE HTML DASHBOARD
+      # ==========================================
+      suite_summary_html = """
+      <div class="card dark:bg-[#1f2937] mb-8 border-l-4 border-blue-400">
+          <h2 class="text-xl font-bold text-gray-700 dark:text-gray-200 mb-4">Per-Suite Summaries</h2>
+          <div class="overflow-x-auto">
+              <table class="w-full text-sm text-left text-gray-600 dark:text-gray-300">
+                  <thead class="text-xs text-gray-700 dark:text-gray-400 uppercase bg-gray-100 dark:bg-gray-700">
+                      <tr>
+                          <th class="px-4 py-2">Suite</th>
+                          <th class="px-4 py-2">Test Type</th>
+                          <th class="px-4 py-2">HW Config</th>
+                          <th class="px-4 py-2">Total Tests</th>
+                          <th class="px-4 py-2">Passed</th>
+                          <th class="px-4 py-2">Failed/Errored</th>
+                          <th class="px-4 py-2">Wall-Clock Duration</th>
+                      </tr>
+                  </thead>
+                  <tbody>
+      """
+      for s, data in suite_summaries.items():
+          suite_summary_html += f"""
+                      <tr class="border-b dark:border-gray-700 bg-white dark:bg-[#1f2937]">
+                          <td class="px-4 py-2 font-bold text-gray-800 dark:text-gray-200">{s}</td>
+                          <td class="px-4 py-2">{data['test_type']}</td>
+                          <td class="px-4 py-2">{data['hw_config']}</td>
+                          <td class="px-4 py-2">{data['total']}</td>
+                          <td class="px-4 py-2 text-green-600 dark:text-green-400 font-bold">{data['passed']}</td>
+                          <td class="px-4 py-2 text-red-600 dark:text-red-400 font-bold">{data['failed']}</td>
+                          <td class="px-4 py-2">{format_duration(data['duration'])}</td>
+                      </tr>
+          """
+      suite_summary_html += "</tbody></table></div></div>"
+
+      hw_charts_html = """
+      <div class="card dark:bg-[#1f2937] mb-8">
+          <h2 class="text-xl font-bold text-gray-700 dark:text-gray-200 mb-6">Pass / Fail Ratio per HW Config</h2>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+      """
+      js_hw_charts = ""
+      for idx, (cfg, stats) in enumerate(hw_config_stats.items()):
+          hw_charts_html += f"""
+              <div class="flex flex-col items-center p-4 bg-gray-50 dark:bg-gray-800 rounded-lg border dark:border-gray-700">
+                  <h3 class="font-bold text-gray-700 dark:text-gray-300 mb-4 truncate max-w-full" title="{cfg}">{cfg}</h3>
+                  <div class="relative h-48 w-full flex justify-center">
+                      <canvas id="hwChart_{idx}"></canvas>
+                  </div>
+                  <div class="mt-4 flex gap-4 text-sm font-medium">
+                      <span class="text-green-500">Pass: {stats['Passed']}</span>
+                      <span class="text-red-500">Fail: {stats['Failed']}</span>
+                      <span class="text-yellow-500">Err: {stats['Error']}</span>
+                  </div>
+              </div>
+          """
+          js_hw_charts += f"""
+              new Chart(document.getElementById('hwChart_{idx}').getContext('2d'), {{
+                  type: 'doughnut',
+                  data: {{
+                      labels: ['Passed', 'Failed', 'Errored'],
+                      datasets: [{{
+                          data: [{stats['Passed']}, {stats['Failed']}, {stats['Error']}],
+                          backgroundColor: ['#22c55e', '#ef4444', '#f59e0b'],
+                          borderWidth: 0
+                      }}]
+                  }},
+                  options: {{ 
+                      responsive: true, maintainAspectRatio: false, cutout: '70%',
+                      plugins: {{ legend: {{ display: false }} }}
+                  }}
+              }});
+          """
+      hw_charts_html += "</div></div>"
+
+      html_content = f"""
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Pipeline Test & Coverage Metrics</title>
+          <script src="https://cdn.tailwindcss.com"></script>
+          <script>
+              tailwind.config = {{ darkMode: 'class' }}
+          </script>
+          <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+          <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
+          <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+          <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+          <style>
+              body {{ background-color: #f3f4f6; font-family: 'Inter', sans-serif; transition: background-color 0.3s, color 0.3s; }}
+              .card {{ background: white; border-radius: 8px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); padding: 1.5rem; }}
+              /* DataTables Dark Mode Fixes */
+              .dark .dataTables_wrapper, .dark .dataTables_info, .dark .dataTables_paginate {{ color: #d1d5db !important; }}
+              .dark table.dataTable tbody tr {{ background-color: #1f2937 !important; color: #d1d5db !important; }}
+              .dark table.dataTable tbody tr:hover {{ background-color: #374151 !important; }}
+              .dark table.dataTable thead th, .dark .dataTables_length label, .dark .dataTables_filter label {{ color: #f3f4f6 !important; border-color: #374151 !important; }}
+              .dark .dataTables_wrapper .dataTables_paginate .paginate_button {{ color: #d1d5db !important; }}
+              .dark .dataTables_wrapper .dataTables_paginate .paginate_button.current {{ background: #374151 !important; color: white !important; border: 1px solid #4b5563 !important; }}
+          </style>
+      </head>
+      <body class="p-8 dark:bg-[#0f1117] dark:text-gray-200">
+          <div class="max-w-7xl mx-auto">
+              <div class="flex flex-col md:flex-row justify-between items-start md:items-end mb-8 border-b dark:border-gray-800 pb-4">
+                  <div>
+                      <h1 class="text-4xl font-bold text-gray-800 dark:text-gray-100 mb-2">Pipeline Metrics Dashboard</h1>
+                      <div class="flex gap-4 text-sm text-gray-600 dark:text-gray-400">
+                          <p><strong>Branch:</strong> {branch}</p>
+                          <p><strong>Commit:</strong> {commit}</p>
+                          <p><strong>Date:</strong> {pipeline_date}</p>
+                          <p><strong>Seed:</strong> <span class="text-indigo-600 dark:text-indigo-400 font-mono font-bold">{random_seed}</span></p>
+                      </div>
+                  </div>
+                  <div class="flex flex-col items-end gap-3 mt-4 md:mt-0">
+                      <button id="themeToggle" class="px-4 py-2 bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700 text-gray-800 dark:text-gray-200 text-sm font-semibold rounded-md shadow transition">
+                          Toggle Dark Mode
+                      </button>
+                      <a href="{pipeline_url}" target="_blank" class="text-blue-600 dark:text-blue-400 underline font-semibold text-sm">View Pipeline on GitLab</a>
+                  </div>
+              </div>
+              
+              <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+                  <div class="card dark:bg-[#1f2937] border-l-4 border-blue-500">
+                      <h3 class="text-gray-500 dark:text-gray-400 text-sm font-semibold uppercase">Total Tests</h3>
+                      <p class="text-3xl font-bold text-gray-800 dark:text-gray-200">{total_tests}</p>
+                  </div>
+                  <div class="card dark:bg-[#1f2937] border-l-4 border-green-500">
+                      <h3 class="text-gray-500 dark:text-gray-400 text-sm font-semibold uppercase">Passed</h3>
+                      <p class="text-3xl font-bold text-green-600 dark:text-green-500">{passed_tests}</p>
+                  </div>
+                  <div class="card dark:bg-[#1f2937] border-l-4 border-red-500">
+                      <h3 class="text-gray-500 dark:text-gray-400 text-sm font-semibold uppercase">Failed / Errored</h3>
+                      <p class="text-3xl font-bold text-red-600 dark:text-red-500">{failed_tests + errored_tests}</p>
+                  </div>
+                  <div class="card dark:bg-[#1f2937] border-l-4 border-purple-500">
+                      <h3 class="text-gray-500 dark:text-gray-400 text-sm font-semibold uppercase">Total Wall-Clock</h3>
+                      <p class="text-3xl font-bold text-purple-600 dark:text-purple-400">{format_duration(total_duration)}</p>
+                  </div>
+              </div>
+              
+              {suite_summary_html}
+              {cov_html}
+              {hw_charts_html}
+              
+              <div class="card dark:bg-[#1f2937] border-t-4 border-gray-700 dark:border-gray-500">
+                  <h2 class="text-xl font-bold text-gray-700 dark:text-gray-200 mb-4">All Test Results</h2>
+                  <div class="overflow-x-auto">
+                      <table id="resultsTable" class="display w-full text-sm text-left text-gray-500 dark:text-gray-300">
+                          <thead class="text-xs text-gray-700 dark:text-gray-300 uppercase bg-gray-50 dark:bg-gray-700 border-b dark:border-gray-600">
+                              <tr>
+                                  <th>Suite</th>
+                                  <th>Test Name</th>
+                                  <th>Type</th>
+                                  <th>HW Config</th>
+                                  <th>Status</th>
+                                  <th>Duration</th>
+                                  <th>Details</th>
+                                  <th>Log</th>
+                                  <th>Rerun</th>
+                              </tr>
+                          </thead>
+                          <tbody>
+      """
+      for t in tests_data:
+          status_color = "text-green-600 dark:text-green-500 font-bold" if t['status'] == 'Passed' else "text-red-600 dark:text-red-500 font-bold"
+          escaped_cmd = t['rerun_cmd'].replace('"', '&quot;').replace("'", "\\'").replace('\n', '\\n')
+          html_content += f"""
+                              <tr>
+                                  <td>{t['suite']}</td>
+                                  <td>{t['name']}</td>
+                                  <td>{t['test_type']}</td>
+                                  <td>{t['hw_config']}</td>
+                                  <td data-order="{t['status_sort']}" class="{status_color}">{t['status']}</td>
+                                  <td data-order="{t['time']}">{format_duration(t['time'])}</td>
+                                  <td class="text-xs truncate max-w-xs" title="{t['message']}">{t['message']}</td>
+                                  <td class="text-blue-500 dark:text-blue-400 underline"><a href="{t['log_link']}" target="_blank">View</a></td>
+                                  <td>
+                                      <details class="cursor-pointer relative">
+                                          <summary class="text-blue-600 dark:text-blue-400 font-semibold select-none text-xs">Commands</summary>
+                                          <div class="mt-2 p-2 bg-gray-900 text-green-400 font-mono text-xs rounded whitespace-pre-wrap text-left min-w-[300px] border border-gray-700 relative">
+                                              <button onclick="navigator.clipboard.writeText('{escaped_cmd}')" class="absolute top-1 right-1 bg-gray-700 hover:bg-gray-600 text-white text-[10px] px-2 py-1 rounded">Copy</button>
+                                              {t['rerun_cmd']}
+                                          </div>
+                                      </details>
+                                  </td>
+                              </tr>
+          """
+      html_content += f"""
+                          </tbody>
+                      </table>
+                  </div>
+              </div>
+
+              {ipc_table_html}
+              
+              {pd_html}
+              {drc_html}
+              
+          </div>
+
+          <script>
+              const themeToggleBtn = document.getElementById('themeToggle');
+              const htmlRoot = document.documentElement;
+              
+              if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {{
+                  htmlRoot.classList.add('dark');
+              }} else {{
+                  htmlRoot.classList.remove('dark');
+              }}
+              
+              themeToggleBtn.addEventListener('click', function() {{
+                  htmlRoot.classList.toggle('dark');
+                  if (htmlRoot.classList.contains('dark')) {{
+                      localStorage.theme = 'dark';
+                  }} else {{
+                      localStorage.theme = 'light';
+                  }}
+              }});
+              
+              {js_hw_charts}
+              {js_pd_charts}
+              {js_drc_charts}
+
+              
+              $(document).ready(function() {{
+                  $('#resultsTable').DataTable({{
+                      "order": [[ 4, "asc" ]], 
+                      "pageLength": 15,
+                      "columnDefs": [ {{ "orderable": false, "targets": 8 }} ]
+                  }});
+                  
+                  // EXACT CODE TO INSERT
+                  $('#ipcTable').DataTable({{
+                      "order": [[ 3, "desc" ]], // Sorts by Calculated IPC descending by default
+                      "pageLength": 15
+                  }});
+              }});
+          </script>
+      </body>
+      </html>
+      """
+      
+      with open('test_metrics_dashboard.html', 'w') as f:
+          f.write(html_content)
+      
+      EOF
+      python3 generate_dashboard.py
+    - end_section "GenerateMetrics"
+  artifacts:
+    when: always
+    paths:
+      - test_metrics_dashboard.html
+      - run_logs/
+    expire_in: 30 days
+
+
+# ------------------------------------------------------------------
+#                     GITLAB PAGES (HOST DASHBOARD)
+# ------------------------------------------------------------------
+
+pages:
+  interruptible: false
+  stage: notify
+  when: always
+  resource_group: $CONCURRENCY_GROUP
+  dependencies:
+    - generate_metrics_dashboard
+  script:
+    - *script_helpers
+    - export pagesArchive=/tools/C/$USER/pagesArchive
+    - start_section "PagesSetup" "Deploying Dashboard to GitLab Pages..."
+    - mkdir -p public
+    - mkdir -p $pagesArchive/run_${CI_PIPELINE_ID}
+    - cp test_metrics_dashboard.html $pagesArchive/run_${CI_PIPELINE_ID}/
+    - cp -r run_logs $pagesArchive/run_${CI_PIPELINE_ID}/ || true
+    - cp -r $pagesArchive/* public/
+    
+    # HTML wrapper containing the top bar and dropdown
+    - |
+      cat << 'EOF' > public/index.html
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Dashboard History</title>
+        <style>
+          body, html { margin: 0; padding: 0; height: 100%; overflow: hidden; font-family: sans-serif; }
+          #topbar { height: 50px; background: #2c3e50; color: white; display: flex; align-items: center; padding: 0 20px; box-sizing: border-box; }
+          select { padding: 5px; font-size: 14px; border-radius: 4px; }
+          iframe { width: 100%; height: calc(100% - 50px); border: none; }
+        </style>
+      </head>
+      <body>
+        <div id="topbar">
+          <b style="margin-right: 15px;">Pipeline Dashboards</b>
+          <label for="runSelect" style="margin-right: 10px;">Select Run:</label>
+          <select id="runSelect" onchange="document.getElementById('frame').src = this.value + '/test_metrics_dashboard.html'">
+      EOF
+      
+    # Populate dropdown options
+    - |
+      cd public
+      # Sort directories so the newest run appears at the top
+      RUNS=$(ls -d run_* 2>/dev/null | sort -rV)
+      LATEST_RUN=""
+      for run in $RUNS; do
+        if [ -z "$LATEST_RUN" ]; then LATEST_RUN=$run; fi
+        echo "          <option value=\"$run\">Pipeline ID: ${run#run_}</option>" >> index.html
+      done
+      
+    # Close HTML wrapper
+    - |
+      cat << EOF >> index.html
+          </select>
+        </div>
+        <iframe id="frame" src="${LATEST_RUN}/test_metrics_dashboard.html"></iframe>
+      </body>
+      </html>
+      EOF
+    - end_section "PagesSetup"
+
+  artifacts:
+    paths:
+      - public
+    expire_in: 10 days
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ------------------------------------------------------------------
+#                     NOTIFICATION
+# ------------------------------------------------------------------
+
+notify_nightly_failure:
+  interruptible: false
+  stage: notify
+  resource_group: $CONCURRENCY_GROUP
+  dependencies:
+    - test_execution  
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_failure
+  script:
+    - echo "Nightly pipeline failed. Finding authors since last success and alerting Google Chat..."
+    - |
+      python3 << 'EOF'
+      import os, json, urllib.request, glob, subprocess
+
+      webhook = 'https://chat.googleapis.com/v1/spaces/AAQAG04btiI/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=pKavV0PjSSZX0n6Oe9RQkzAXLO7fgjZwTrqhyXkfRrY'
+
+      api_url = os.environ.get('CI_API_V4_URL')
+      project_id = os.environ.get('CI_PROJECT_ID')
+      branch = os.environ.get('CI_COMMIT_BRANCH')
+      job_token = os.environ.get('CI_JOB_TOKEN')
+      pipeline_url = os.environ.get('CI_PIPELINE_URL')
+
+      try:
+          subprocess.run(['git', 'fetch', '--unshallow'], stderr=subprocess.DEVNULL)
+      except Exception:
+          pass
+
+      last_success_sha = None
+      last_success_url = "N/A"
+      try:
+          url = f'{api_url}/projects/{project_id}/pipelines?status=success&source=schedule&ref={branch}'
+          req = urllib.request.Request(url, headers={'JOB-TOKEN': job_token})
+          with urllib.request.urlopen(req) as response:
+              pipelines = json.loads(response.read().decode())
+              if pipelines:
+                  last_success_sha = pipelines[0].get('sha')
+                  last_success_url = pipelines[0].get('web_url')
+      except Exception as e:
+          print(f'Could not fetch pipeline history from API: {e}')
+
+      try:
+          if last_success_sha:
+              print(f'Found last successful nightly at {last_success_sha}. Getting authors...')
+              git_cmd = ['git', 'log', f'{last_success_sha}..HEAD', '--format=%ae']
+          else:
+              print('No previous successful nightly found. Defaulting to commits from the last 24 hours.')
+              git_cmd = ['git', 'log', '--since=24 hours ago', '--format=%ae']
+          
+          output = subprocess.check_output(git_cmd, text=True)
+          emails = set(line.strip() for line in output.splitlines() if line.strip())
+          
+          if not emails:
+              output = subprocess.check_output(['git', 'log', '-1', '--format=%ae'], text=True)
+              emails = set(line.strip() for line in output.splitlines() if line.strip())
+              
+      except Exception as e:
+          print(f'Error running git log: {e}')
+          output = subprocess.check_output(['git', 'log', '-1', '--format=%ae'], text=True)
+          emails = set(line.strip() for line in output.splitlines() if line.strip())
+
+      formatted_emails = []
+      for email in emails:
+          prefix = email.split('@')[0]
+          formatted_emails.append(f'<users/{prefix}@berkeley.edu>')
+
+      mentions = ' '.join(formatted_emails) if formatted_emails else 'Team'
+
+      failed_tests = []
+      for log in glob.glob('log_*.txt'):
+          try:
+              with open(log, 'r') as f:
+                  for line in f:
+                      if '[ FAIL ]' in line or '[ ERROR ]' in line:
+                          parts = line.split()
+                          if len(parts) >= 4:
+                              failed_tests.append(parts[3])
+          except Exception as e:
+              print(f'Error reading log {log}: {e}')
+
+      test_str = '\n'.join(['- ' + t for t in failed_tests]) if failed_tests else 'Could not parse specific test names. Check logs.'
+
+      msg = f'🥀 *Nightly Pipeline Failed!* 🥀\n*Responsible:* {mentions}\n*Failed Pipeline:* {pipeline_url}\n*Last Successful Nightly:* {last_success_url}\n\n*Failed Tests:*\n{test_str}'
+
+      print('Sending payload to Google Chat...')
+      req = urllib.request.Request(
+          webhook, 
+          data=json.dumps({'text': msg}).encode('utf-8'), 
+          headers={'Content-Type': 'application/json'}
+      )
+      
+      try:
+          urllib.request.urlopen(req)
+          print('Notification sent successfully.')
+      except Exception as e:
+          print(f'Failed to send notification: {e}')
+      EOF
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ------------------------------------------------------------------
+#                     CLEAN UP
+# ------------------------------------------------------------------
+
+Clean-Up:
+  interruptible: false
+  stage: clean
+  when: always
+  script:
+    - |
+      echo "BEGINNING CLEAN..."
+      
+      CLEANUP_DIR="/tools/C/$USER/TEMP_RM_DIR_${CI_PIPELINE_ID}_${CI_JOB_ID}"
+      
+      if [ -d "/tools/C/$USER/CI_CD_${CI_PIPELINE_ID}" ]; then
+        echo "MOVING BUILD TO ${CLEANUP_DIR} FOR REMOVAL" 
+        mv "/tools/C/$USER/CI_CD_${CI_PIPELINE_ID}" "${CLEANUP_DIR}"
+        
+        rm -rf "${CLEANUP_DIR}"
+        echo "CLEAN FINISHED"
+      else
+        echo "No CI_CD directory found to clean. Exiting cleanly."
+      fi
