@@ -83,9 +83,9 @@ object SophiaLakeSerialTL {
 class WithSophiaLakeChipSerialTL extends Config(
   new WithSerialTL(Seq(SophiaLakeSerialTL.chipLink())))
 
-/** FA26: 32 lanes per direction with 32-bit flits (matches the chip's SerialTL). TODO: confirm flit width with the chip owner. */
+/** FA26: 32 lanes per direction with 16-bit flits  */
 class WithSophiaLakeFA26ChipSerialTL extends Config(
-  new WithSerialTL(Seq(SophiaLakeSerialTL.chipLink(phitWidth = 32, flitWidth = 32))))
+  new WithSerialTL(Seq(SophiaLakeSerialTL.chipLink(phitWidth = 32, flitWidth = 16))))
 
 /** Port 0 to our own testchip, port 1 to the peer FPGA (C2C bringup). */
 class WithSophiaLakeC2CSerialTL extends Config(
@@ -130,7 +130,6 @@ class SophiaLakeDSP25C2CConfig extends Config(
 // FA26
 // ---------------------------------------------------------
 
-/** Select with SophiaLakeHarness for the FA26 32-bit pinout. */
 class SophiaLakeFA26Config extends Config(
   new WithFA26SophiaLakeSerialTLToGPIO ++
   new WithSophiaLakeFA26ChipSerialTL ++
