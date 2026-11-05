@@ -9,6 +9,8 @@ import freechips.rocketchip.tilelink.{TLBundle}
 import sifive.blocks.devices.uart.{UARTPortIO}
 import sifive.blocks.devices.spi.{HasPeripherySPI, SPIPortIO}
 
+import sifive.fpgashells.shell.IOPin
+
 import chipyard._
 import chipyard.harness._
 import chipyard.iobinders._
@@ -20,10 +22,45 @@ class WithUART extends HarnessBinder({
   }
 })
 
+// UART-TSI on the on-board USB-UART (via the VCU118 UART overlay)
+class WithVCU118UARTTSI extends HarnessBinder({
+  case (th: VCU118FPGATestHarnessImp, port: UARTTSIPort, chipId: Int) => {
+    th.vcu118Outer.io_uart_bb.bundle <> port.io.uart
+  }
+})
+
+
+
+class WithVCU118UARTToPMOD(
+  ioStandard: String = "LVCMOS18"
+) extends HarnessBinder({
+  case (th: VCU118FPGATestHarnessImp, port: UARTPort, chipId: Int) => {
+    val vth = th.vcu118Outer
+    val harnessIO = IO(chiselTypeOf(port.io)).suggestName("uart_periph")
+    harnessIO <> port.io
+
+    val rxdIO = IOPin(harnessIO.rxd) // chip's UART RX  (driven by FTDI TX)
+    val txdIO = IOPin(harnessIO.txd) // chip's UART TX  (drives FTDI RX)
+
+    val packagePinsWithPackageIOs = Seq(
+      ("AT16", rxdIO), // chip RX -- PMOD J52 pin 10 (FTDI TX wires here)
+      ("AV15", txdIO), // chip TX -- PMOD J52 pin 9  (was SDIO spi_clk; freed by dropping SDIO)
+    )
+
+    packagePinsWithPackageIOs.foreach { case (pkgPin, io) =>
+      vth.xdc.addPackagePin(io, pkgPin)
+      vth.xdc.addIOStandard(io, ioStandard)
+      vth.xdc.addIOB(io)
+    }
+    // Pullup on RX so an unconnected line idles high instead of detecting a spurious start bit.
+    vth.xdc.addPullup(rxdIO)
+  }
+})
+
 /*** SPI ***/
 class WithSPISDCard extends HarnessBinder({
   case (th: VCU118FPGATestHarnessImp, port: SPIPort, chipId: Int) => {
-    th.vcu118Outer.io_spi_bb.bundle <> port.io
+    th.vcu118Outer.io_spi_bb.get.bundle <> port.io
   }
 })
 

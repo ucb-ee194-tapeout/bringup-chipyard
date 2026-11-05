@@ -68,10 +68,13 @@ class VCU118FPGATestHarness(override implicit val p: Parameters) extends VCU118S
 
   /*** SPI ***/
 
-  // 1st SPI goes to the VCU118 SDIO port
-
-  val io_spi_bb = BundleBridgeSource(() => (new SPIPortIO(dp(PeripherySPIKey).head)))
-  dp(SPIOverlayKey).head.place(SPIDesignInput(dp(PeripherySPIKey).head, io_spi_bb))
+  // 1st SPI goes to the VCU118 SDIO port (only when a SPI peripheral is present)
+  val io_spi_bb: Option[BundleBridgeSource[SPIPortIO]] =
+    if (dp(PeripherySPIKey).nonEmpty && dp(SPIOverlayKey).nonEmpty) {
+      val bb = BundleBridgeSource(() => (new SPIPortIO(dp(PeripherySPIKey).head)))
+      dp(SPIOverlayKey).head.place(SPIDesignInput(dp(PeripherySPIKey).head, bb))
+      Some(bb)
+    } else None
 
   /*** DDR ***/
 
