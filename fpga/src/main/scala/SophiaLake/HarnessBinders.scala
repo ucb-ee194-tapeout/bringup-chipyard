@@ -131,6 +131,44 @@ object SophiaLakePins {
     ath.xdc.clockDedicatedRouteFalse(clkIO)
   }
 
+  //==========================================================
+  // FA26 Sophia Lake: 1.8 V chip-link IO
+  //==========================================================
+
+  /** Dedicated FA26 constraints, kept separate from the legacy chip links. */
+  def constrainFA26ChipLink(ath: SophiaLakeHarness, io: DecoupledPhitIO): Unit = {
+    val pins = fa26ChipLink
+    val clkIO = io match {
+      case io: HasClockOut => IOPin(io.clock_out)
+      case io: HasClockIn  => IOPin(io.clock_in)
+    }
+    val packagePinsWithPackageIOs =
+      Seq(
+        (pins.clock,    clkIO),
+        (pins.outValid, IOPin(io.out.valid)),
+        (pins.outReady, IOPin(io.out.ready))
+      ) ++
+      pins.outPhit.zipWithIndex.map { case (pin, i) => (pin, IOPin(io.out.bits.phit, i)) } ++
+      Seq(
+        (pins.inValid, IOPin(io.in.valid)),
+        (pins.inReady, IOPin(io.in.ready))
+      ) ++
+      pins.inPhit.zipWithIndex.map { case (pin, i) => (pin, IOPin(io.in.bits.phit, i)) }
+
+    addPins(ath, packagePinsWithPackageIOs, "LVCMOS18", iob = false)
+
+    // Don't add IOB to the clock, if its an input
+    val iobPins = io match {
+      case _: DecoupledInternalSyncPhitIO => packagePinsWithPackageIOs
+      case _: DecoupledExternalSyncPhitIO => packagePinsWithPackageIOs.drop(1)
+    }
+    iobPins.foreach { case (_, io) => ath.xdc.addIOB(io) }
+
+    ath.sdc.addClock("ser_tl_clock", clkIO, 100)
+    ath.sdc.addGroup(pins = Seq(clkIO))
+    ath.xdc.clockDedicatedRouteFalse(clkIO)
+  }
+
   /** Pin out a credited source-sync C2C port.
     *
     * The forwarded clock goes out INVERTED (180 deg) so the far side samples in
@@ -179,7 +217,7 @@ class WithFA26SophiaLakeSerialTLToGPIO extends HarnessBinder({
     harnessIO <> port.io
     harnessIO match {
       case io: DecoupledPhitIO =>
-        SophiaLakePins.constrainChipLink(ath, io, SophiaLakePins.fa26ChipLink)
+        SophiaLakePins.constrainFA26ChipLink(ath, io)
     }
   }
 })
