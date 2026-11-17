@@ -44,7 +44,8 @@ case class CreditedC2CPins(
   inPhit:    String)
 
 object SophiaLakePins {
-  // TL_IN goes to FPGA out; TL_OUT comes from the chip to FPGA in.
+    /** fa26 (Penguin 26) is the mirror image of DSP25 aside 
+    from additional pins: it drives what DSP25 listens on. */
   val fa26ChipLink = DecoupledSerialTLPins(
     clock    = "B20",
     outValid = "B22", outReady = "L18",
@@ -135,7 +136,7 @@ object SophiaLakePins {
   // FA26 Sophia Lake: 1.8 V chip-link IO
   //==========================================================
 
-  /** Dedicated FA26 constraints, kept separate from the legacy chip links. */
+  /** Pin out a decoupled serial-TL port and constrain its forwarded clock. 1.8V IO */
   def constrainFA26ChipLink(ath: SophiaLakeHarness, io: DecoupledPhitIO): Unit = {
     val pins = fa26ChipLink
     val clkIO = io match {
@@ -164,7 +165,7 @@ object SophiaLakePins {
     }
     iobPins.foreach { case (_, io) => ath.xdc.addIOB(io) }
 
-    ath.sdc.addClock("ser_tl_clock", clkIO, 100)
+    ath.sdc.addClock("ser_tl_clock", clkIO, 50)
     ath.sdc.addGroup(pins = Seq(clkIO))
     ath.xdc.clockDedicatedRouteFalse(clkIO)
   }
