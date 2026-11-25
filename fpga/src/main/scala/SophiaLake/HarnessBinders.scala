@@ -44,8 +44,7 @@ case class CreditedC2CPins(
   inPhit:    String)
 
 object SophiaLakePins {
-    /** fa26 (Penguin 26) is the mirror image of DSP25 aside 
-    from additional pins: it drives what DSP25 listens on. */
+  // TL_IN goes to FPGA out; TL_OUT comes from the chip to FPGA in.
   val fa26ChipLink = DecoupledSerialTLPins(
     clock    = "B20",
     outValid = "B22", outReady = "L18",
@@ -60,6 +59,12 @@ object SophiaLakePins {
       "G20", "J15", "G21", "N20", "H20", "L15", "C19", "N18",
       "D21", "A13", "N22", "N19", "K21", "L14", "D16", "K13",
       "M21", "M16", "L21", "A16", "C17", "H13", "F18", "E13"))
+
+  /** Internal pull-downs replacing chip-board resistors R1/R6, which were removed
+    * because they bent the SODIMM socket pins. They sit on chip nets TL_IN_VLD
+    * (B22) and TL_OUT_RDY (J17). Both are FPGA outputs, so the pull only matters
+    * when the FPGA isn't driving them; hold the chip in reset until the FPGA is programmed. */
+  val fa26Pulldowns = Set(fa26ChipLink.outValid, fa26ChipLink.inReady)
 
   val dsp25ChipLink = DecoupledSerialTLPins(
     clock    = "A21",
@@ -91,16 +96,29 @@ object SophiaLakePins {
     pins: Seq[(String, IOPin)],
     ioStandard: String,
     iob: Boolean = true,
-    pullup: Boolean = false
-  ): Unit = pins.foreach { case (pin, io) =>
-    ath.xdc.addPackagePin(io, pin)
-    ath.xdc.addIOStandard(io, ioStandard)
-    if (iob)    ath.xdc.addIOB(io)
-    if (pullup) ath.xdc.addPullup(io)
+    pullup: Boolean = false,
+    pulldown: Boolean = false
+  ): Unit = {
+    require(!(pullup && pulldown), "Cannot enable both pull-up and pull-down on a pin")
+    pins.foreach { case (pin, io) =>
+      ath.xdc.addPackagePin(io, pin)
+      ath.xdc.addIOStandard(io, ioStandard)
+      if (iob)      ath.xdc.addIOB(io)
+      if (pullup)   ath.xdc.addPullup(io)
+      if (pulldown) ath.xdc.addPulldown(io)
+    }
   }
 
-  /** Pin out a decoupled serial-TL port and constrain its forwarded clock. */
-  def constrainChipLink(ath: SophiaLakeHarness, io: DecoupledPhitIO, pins: DecoupledSerialTLPins): Unit = {
+  /** Pin out a decoupled serial-TL port and constrain its forwarded clock.
+    * Defaults match the legacy 1.2 V chip links (DSP25, BML25). */
+  def constrainChipLink(
+    ath: SophiaLakeHarness,
+    io: DecoupledPhitIO,
+    pins: DecoupledSerialTLPins,
+    ioStandard: String = "LVCMOS12",
+    clockMHz: Double = 100,
+    pulldownPins: Set[String] = Set.empty
+  ): Unit = {
     val clkIO = io match {
       case io: HasClockOut => IOPin(io.clock_out)
       case io: HasClockIn  => IOPin(io.clock_in)
@@ -118,54 +136,21 @@ object SophiaLakePins {
       ) ++
       pins.inPhit.zipWithIndex.map { case (pin, i) => (pin, IOPin(io.in.bits.phit, i)) }
 
-    addPins(ath, packagePinsWithPackageIOs, "LVCMOS12", iob = false)
+    val unknownPulldownPins = pulldownPins -- packagePinsWithPackageIOs.map(_._1).toSet
+    require(unknownPulldownPins.isEmpty,
+      s"Pull-down pins are not part of this chip link: ${unknownPulldownPins.toSeq.sorted.mkString(", ")}")
+    packagePinsWithPackageIOs.foreach { case (pin, io) =>
+      addPins(ath, Seq((pin, io)), ioStandard, iob = false, pulldown = pulldownPins.contains(pin))
+    }
 
-    // Don't add IOB to the clock, if its an input
+    // Don't add IOB to the clock if it's an input
     val iobPins = io match {
       case _: DecoupledInternalSyncPhitIO => packagePinsWithPackageIOs
       case _: DecoupledExternalSyncPhitIO => packagePinsWithPackageIOs.drop(1)
     }
     iobPins.foreach { case (_, io) => ath.xdc.addIOB(io) }
 
-    ath.sdc.addClock("ser_tl_clock", clkIO, 100)
-    ath.sdc.addGroup(pins = Seq(clkIO))
-    ath.xdc.clockDedicatedRouteFalse(clkIO)
-  }
-
-  //==========================================================
-  // FA26 Sophia Lake: 1.8 V chip-link IO
-  //==========================================================
-
-  /** Pin out a decoupled serial-TL port and constrain its forwarded clock. 1.8V IO */
-  def constrainFA26ChipLink(ath: SophiaLakeHarness, io: DecoupledPhitIO): Unit = {
-    val pins = fa26ChipLink
-    val clkIO = io match {
-      case io: HasClockOut => IOPin(io.clock_out)
-      case io: HasClockIn  => IOPin(io.clock_in)
-    }
-    val packagePinsWithPackageIOs =
-      Seq(
-        (pins.clock,    clkIO),
-        (pins.outValid, IOPin(io.out.valid)),
-        (pins.outReady, IOPin(io.out.ready))
-      ) ++
-      pins.outPhit.zipWithIndex.map { case (pin, i) => (pin, IOPin(io.out.bits.phit, i)) } ++
-      Seq(
-        (pins.inValid, IOPin(io.in.valid)),
-        (pins.inReady, IOPin(io.in.ready))
-      ) ++
-      pins.inPhit.zipWithIndex.map { case (pin, i) => (pin, IOPin(io.in.bits.phit, i)) }
-
-    addPins(ath, packagePinsWithPackageIOs, "LVCMOS18", iob = false)
-
-    // Don't add IOB to the clock, if its an input
-    val iobPins = io match {
-      case _: DecoupledInternalSyncPhitIO => packagePinsWithPackageIOs
-      case _: DecoupledExternalSyncPhitIO => packagePinsWithPackageIOs.drop(1)
-    }
-    iobPins.foreach { case (_, io) => ath.xdc.addIOB(io) }
-
-    ath.sdc.addClock("ser_tl_clock", clkIO, 50)
+    ath.sdc.addClock("ser_tl_clock", clkIO, clockMHz)
     ath.sdc.addGroup(pins = Seq(clkIO))
     ath.xdc.clockDedicatedRouteFalse(clkIO)
   }
@@ -206,19 +191,73 @@ object SophiaLakePins {
 }
 
 
+/** Board-local pad port; reuse the analog bundle already provided by FPGA-shells. */
+case class I2CPinsPort(val getIO: () => ShellI2CPortIO, val i2cId: Int)
+    extends Port[ShellI2CPortIO]
+
+/** Open-drain I2C IO cells: out is tied low, oe selects drive-low vs. high-Z. */
+class WithI2CIOCells extends OverrideIOBinder({
+  (system: sifive.blocks.devices.i2c.HasPeripheryI2C) => {
+    val p = GetSystemParameters(system)
+    val (ports, cells) = system.i2c.zipWithIndex.map { case (i2c, i) =>
+      val pads = IO(new ShellI2CPortIO).suggestName(s"i2c_${i}")
+      val gpioCells = Seq(
+        ("sda", i2c.sda, pads.sda),
+        ("scl", i2c.scl, pads.scl)
+      ).map { case (name, core, pad) =>
+        val cell = p(IOCellKey).gpio().suggestName(s"iocell_i2c_${i}_${name}")
+        cell.io.o := core.out
+        cell.io.oe := core.oe
+        cell.io.ie := true.B
+        core.in := cell.io.i
+        cell.io.pad <> pad
+        cell
+      }
+      (I2CPinsPort(() => pads, i), gpioCells)
+    }.unzip
+    (ports, cells.flatten)
+  }
+})
+
+/** Clock-chip I2C: SDA=D22, SCL=D19, 1.8 V bank. */
+class WithSophiaLakeClockI2C(ioStandard: String) extends HarnessBinder({
+  case (th: HasHarnessInstantiators, port: I2CPinsPort, chipId: Int) => {
+    require(chipId == 0 && port.i2cId == 0,
+      "SophiaLake clock I2C maps only controller 0 on chip 0 to D22/D19")
+    require(ioStandard == "LVCMOS18",
+      "SophiaLake clock I2C is on a 1.8 V bank (LVCMOS18)")
+    val ath = SophiaLakePins.harness(th)
+    val harnessIO = IO(new ShellI2CPortIO).suggestName("clkgen_i2c")
+    harnessIO <> port.io
+
+    SophiaLakePins.addPins(ath, Seq(
+      ("D22", IOPin(harnessIO.sda)),
+      ("D19", IOPin(harnessIO.scl))
+    ), ioStandard, iob = false, pullup = true)
+  }
+})
+
+
 //==========================================================
 // Serial-TL to GPIO binders
 //==========================================================
 
-/** Copy the configured 32-bit IO and reuse the board's constraint helper. */
-class WithFA26SophiaLakeSerialTLToGPIO extends HarnessBinder({
+/** FA26: 32-bit chip link at 1.8 V.
+  * @param clockMHz  link clock used for the SDC timing constraint (must match the PHY's freqMHz)
+  * @param pulldowns add internal pull-downs on `fa26Pulldowns` (B22, J17) */
+class WithFA26SophiaLakeSerialTLToGPIO(
+  clockMHz: Double = 50,
+  pulldowns: Boolean = false
+) extends HarnessBinder({
   case (th: HasHarnessInstantiators, port: SerialTLPort, chipId: Int) => {
     val ath = SophiaLakePins.harness(th)
     val harnessIO = IO(chiselTypeOf(port.io)).suggestName("serial_tl")
     harnessIO <> port.io
     harnessIO match {
       case io: DecoupledPhitIO =>
-        SophiaLakePins.constrainFA26ChipLink(ath, io)
+        SophiaLakePins.constrainChipLink(ath, io, SophiaLakePins.fa26ChipLink,
+          ioStandard = "LVCMOS18", clockMHz = clockMHz,
+          pulldownPins = if (pulldowns) SophiaLakePins.fa26Pulldowns else Set.empty)
     }
   }
 })

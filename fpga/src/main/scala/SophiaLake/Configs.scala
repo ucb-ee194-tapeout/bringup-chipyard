@@ -41,7 +41,8 @@ object SophiaLakeSerialTL {
     * single-chip configs, SBUS for the C2C configs (which keep [0, 4 GiB) on
     * this FPGA and reserve the OBUS for the peer).
     */
-  def chipLink(slaveWhere: TLBusWrapperLocation = OBUS, phitWidth: Int = 8, flitWidth: Int = 16) = SerialTLParams(
+  def chipLink(slaveWhere: TLBusWrapperLocation = OBUS, phitWidth: Int = 8,
+               flitWidth: Int = 16, freqMHz: Int = 50) = SerialTLParams(
     manager = Some(SerialTLManagerParams(
       memParams = Seq(ManagerRAMParams(
         address = BigInt("00000000", 16),
@@ -50,7 +51,8 @@ object SophiaLakeSerialTL {
       slaveWhere = slaveWhere
     )),
     client    = Some(SerialTLClientParams()),
-    phyParams = DecoupledInternalSyncSerialPhyParams(phitWidth = phitWidth, flitWidth = flitWidth, freqMHz = 50)
+    phyParams = DecoupledInternalSyncSerialPhyParams(phitWidth = phitWidth,
+      flitWidth = flitWidth, freqMHz = freqMHz)
   )
 
   /** Port 1 of the C2C designs: the 1-bit credited source-synchronous link to
@@ -83,9 +85,9 @@ object SophiaLakeSerialTL {
 class WithSophiaLakeChipSerialTL extends Config(
   new WithSerialTL(Seq(SophiaLakeSerialTL.chipLink())))
 
-/** FA26: 32 lanes per direction with 32-bit flits  */
-class WithSophiaLakeFA26ChipSerialTL extends Config(
-  new WithSerialTL(Seq(SophiaLakeSerialTL.chipLink(phitWidth = 32, flitWidth = 32))))
+/** FA26: 32 lanes per direction with 32-bit flits. */
+class WithSophiaLakeFA26ChipSerialTL(freqMHz: Int = 50) extends Config(
+  new WithSerialTL(Seq(SophiaLakeSerialTL.chipLink(phitWidth = 32, flitWidth = 32, freqMHz = freqMHz))))
 
 /** Port 0 to our own testchip, port 1 to the peer FPGA (C2C bringup). */
 class WithSophiaLakeC2CSerialTL extends Config(
@@ -119,7 +121,7 @@ class SophiaLakeDSP25Config extends Config(
   new WithDSP25SophiaLakeSerialTLToGPIO ++
   new WithSophiaLakeChipSerialTL ++
   new SophiaLakeConfig(freqMHz = 50))
-  
+
 class SophiaLakeDSP25C2CConfig extends Config(
   new WithDSP25C2CSophiaLakeSerialTLToGPIO ++
   new WithSophiaLakeC2C(scratchpadBase = BigInt("c0000000", 16)))
@@ -129,12 +131,29 @@ class SophiaLakeDSP25C2CConfig extends Config(
 // ---------------------------------------------------------
 // FA26
 // ---------------------------------------------------------
+// FA26 configs: link at 50 or 10 MHz, each with or without the R1/R6 pull-downs.
 
 class SophiaLakeFA26Config extends Config(
-  new WithFA26SophiaLakeSerialTLToGPIO ++
-  new WithSophiaLakeFA26ChipSerialTL ++
+  new WithFA26SophiaLakeSerialTLToGPIO() ++
+  new WithSophiaLakeFA26ChipSerialTL() ++
   new SophiaLakeConfig(freqMHz = 50))
 
+/** FA26 (50 MHz link) with internal pull-downs on B22/J17 (TL_IN_VLD, TL_OUT_RDY). */
+class SophiaLakeFA26PulldownConfig extends Config(
+  new WithFA26SophiaLakeSerialTLToGPIO(pulldowns = true) ++
+  new SophiaLakeFA26Config)
+
+/** FA26 bring-up: 10 MHz chip link, divided down from the 50 MHz design clock. */
+class SophiaLakeFA26Link10MHzConfig extends Config(
+  new WithFA26SophiaLakeSerialTLToGPIO(clockMHz = 10) ++
+  new WithSophiaLakeFA26ChipSerialTL(freqMHz = 10) ++
+  new WithDividerHarnessClockInstantiator ++
+  new SophiaLakeConfig(freqMHz = 50))
+
+/** FA26 (10 MHz link) with internal pull-downs on B22/J17 (TL_IN_VLD, TL_OUT_RDY). */
+class SophiaLakeFA26Link10MHzPulldownConfig extends Config(
+  new WithFA26SophiaLakeSerialTLToGPIO(clockMHz = 10, pulldowns = true) ++
+  new SophiaLakeFA26Link10MHzConfig)
 
 // ---------------------------------------------------------
 // BearlyML 25
@@ -240,3 +259,23 @@ class DividerHarnessClockInstantiator extends HarnessClockInstantiator {
 class WithDividerHarnessClockInstantiator extends Config((site, here, up) => {
   case HarnessClockInstantiatorKey => () => new DividerHarnessClockInstantiator
 })
+
+/** Standalone laptop-controlled clock programmer; no offchip SerialTL manager. */
+class SophiaLakeClockProgConfig extends Config(
+  new WithI2CIOCells ++
+  new WithSophiaLakeClockI2C(ioStandard = "LVCMOS18") ++
+  new testchipip.serdes.WithNoSerialTL ++
+  new WithSophiaLakeTweaks(freqMHz = 50) ++
+  new chipyard.config.WithI2C(address = 0x40000000) ++
+  new chipyard.NoCoresConfig)
+
+/** Same as SophiaLakeClockProgConfig, with a 10 MHz design clock divided from
+  * the 50 MHz reference. In the notebook, set CONTROLLER_CLOCK_HZ = 10_000_000. */
+class SophiaLakeClockProg10MHzConfig extends Config(
+  new WithI2CIOCells ++
+  new WithSophiaLakeClockI2C(ioStandard = "LVCMOS18") ++
+  new testchipip.serdes.WithNoSerialTL ++
+  new WithDividerHarnessClockInstantiator ++
+  new WithSophiaLakeTweaks(freqMHz = 10) ++
+  new chipyard.config.WithI2C(address = 0x40000000) ++
+  new chipyard.NoCoresConfig)
